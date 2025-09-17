@@ -6,16 +6,21 @@ from __future__ import annotations
 
 from collections import defaultdict
 from functools import partial
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from distributed import get_worker
 
 from rapidsmpf.config import Options
 from rapidsmpf.integrations.core import (
+    JoinIntegration,
     extract_partition,
+    get_allgather,
     get_new_shuffle_id,
     get_shuffler,
+    insert_chunk,
     insert_partition,
+    join_chunk,
+    stage_results,
 )
 from rapidsmpf.integrations.dask.core import (
     get_dask_client,
@@ -44,8 +49,8 @@ def _get_occupied_ids_dask(client: Client) -> list[set[int]]:
 
 
 def _worker_rmpf_barrier(
-    shuffle_ids: tuple[int, ...],
-    partition_count: int,
+    op_ids: tuple[int, ...],
+    partition_count: int | None,
     dependency: None,
 ) -> None:
     """
@@ -53,13 +58,14 @@ def _worker_rmpf_barrier(
 
     Parameters
     ----------
-    shuffle_ids
-        Tuple of shuffle ids associated with the current
+    op_ids
+        Tuple of operation ids associated with the current
         task graph. This tuple will only contain a single
-        integer when `rapidsmpf_shuffle_graph` is used for
-        graph generation.
+        integer when `rapidsmpf_shuffle_graph` or
+        `rapidsmpf_bcast_join_graph` is used for graph generation.
     partition_count
         Number of output partitions for the current shuffle.
+        This value is None for allgather operations.
     dependency
         Null argument used to enforce barrier dependencies.
 
@@ -68,10 +74,14 @@ def _worker_rmpf_barrier(
     A worker barrier task DOES need to be restricted
     to a specific Dask worker.
     """
-    for shuffle_id in shuffle_ids:
-        shuffler = get_shuffler(get_worker_context(), shuffle_id)
-        for pid in range(partition_count):
-            shuffler.insert_finished(pid)
+    for op_id in op_ids:
+        if partition_count is None:
+            allgather = get_allgather(get_worker_context(), op_id)
+            allgather.insert_finished()
+        else:
+            shuffler = get_shuffler(get_worker_context(), op_id)
+            for pid in range(partition_count):
+                shuffler.insert_finished(pid)
 
 
 def _stage_shuffler(
@@ -104,12 +114,26 @@ def _stage_shuffler(
     )
 
 
-def _get_dask_worker_ranks_and_stage_shuffler(
-    shuffle_id: int, partition_count: int, dask_worker: Worker | None = None
+def _stage_allgather(
+    allgather_id: int,
+    worker: Worker | None = None,
+) -> None:
+    worker = worker or get_worker()
+    get_allgather(get_worker_context(worker), allgather_id, worker=worker)
+
+
+def _get_dask_worker_ranks_and_stage_operation(
+    op_id: int,
+    partition_count: int,
+    dask_worker: Worker | None = None,
+    operation: Literal["allgather", "shuffler"] = "shuffler",
 ) -> int:
     rank = get_dask_worker_rank(dask_worker)
 
-    _stage_shuffler(shuffle_id, partition_count, dask_worker)
+    if operation == "shuffler":
+        _stage_shuffler(op_id, partition_count, dask_worker)
+    elif operation == "allgather":
+        _stage_allgather(op_id, dask_worker)
 
     return rank
 
@@ -220,9 +244,10 @@ def rapidsmpf_shuffle_graph(
     worker_ranks: dict[int, str] = {
         v: k
         for k, v in client.run(
-            _get_dask_worker_ranks_and_stage_shuffler,
+            _get_dask_worker_ranks_and_stage_operation,
             shuffle_id,
             partition_count_out,
+            operation="shuffler",
         ).items()
     }
 
@@ -295,6 +320,142 @@ def rapidsmpf_shuffle_graph(
 
     # Tell the scheduler to restrict the shuffle keys
     # to specific workers
+    client._send_to_scheduler(
+        {
+            "op": "rmpf_add_restricted_tasks",
+            "tasks": restricted_keys,
+        }
+    )
+
+    return graph
+
+
+def rapidsmpf_bcast_join_graph(
+    left_name: str,
+    right_name: str,
+    output_name: str,
+    bcast_side: Literal["left", "right"],
+    left_partition_count_in: int,
+    right_partition_count_in: int,
+    integration: JoinIntegration,
+    options: Any,
+    config_options: Options = Options(),
+) -> dict[Any, Any]:
+    """Return the task graph for a RapidsMPF broadcast join."""
+    # Get the shuffle id
+    client = get_dask_client(options=config_options)
+    # TODO: Use allgather id
+    allgather_id = get_new_shuffle_id(partial(_get_occupied_ids_dask, client))
+    if bcast_side == "right":
+        small_name = right_name
+        large_name = left_name
+        small_count = right_partition_count_in
+        large_count = left_partition_count_in
+    else:
+        small_name = left_name
+        large_name = right_name
+        small_count = left_partition_count_in
+        large_count = right_partition_count_in
+
+    # Note: We've observed high overhead from `Client.run` on some systems with
+    # some networking configurations. Minimize the number of `Client.run` calls
+    # by batching as much work as possible into a single call as possible.
+    # See https://github.com/rapidsai/rapidsmpf/pull/323 for more.
+    worker_ranks: dict[int, str] = {
+        v: k
+        for k, v in client.run(
+            _get_dask_worker_ranks_and_stage_operation,
+            allgather_id,
+            large_count,
+            operation="allgather",
+        ).items()
+    }
+    restricted_keys: MutableMapping[Any, str] = {}
+
+    # Define task names for each phase of the broadcast join
+    insert_name = f"rmpf-insert-{output_name}"
+    stage_name = f"rmpf-stage-{output_name}"
+    global_barrier_1_name = f"rmpf-global-barrier-1-{output_name}"
+    global_barrier_2_name = f"rmpf-global-barrier-2-{output_name}"
+    global_barrier_3_name = f"rmpf-global-barrier-3-{output_name}"
+    worker_barrier_name = f"rmpf-worker-barrier-{output_name}"
+
+    # Add tasks to broadcast each small-table partition
+    graph: dict[Any, Any] = {
+        (insert_name, pid): (
+            insert_chunk,
+            get_worker_context,
+            integration.insert_chunk,
+            (small_name, pid),
+            allgather_id,
+            options,
+        )
+        for pid in range(small_count)
+    }
+
+    # Add global barrier task
+    graph[global_barrier_1_name] = (
+        global_rmpf_barrier,
+        *graph.keys(),
+    )
+
+    # Add worker barrier tasks
+    worker_barriers: dict[Any, Any] = {}
+    for rank, addr in worker_ranks.items():
+        key = (worker_barrier_name, rank)
+        worker_barriers[rank] = key
+        graph[key] = (
+            _worker_rmpf_barrier,
+            (allgather_id,),
+            None,
+            global_barrier_1_name,
+        )
+        restricted_keys[key] = addr
+
+    # Add global barrier task
+    graph[global_barrier_2_name] = (
+        global_rmpf_barrier,
+        *worker_barriers.values(),
+    )
+
+    # Add staging tasks
+    staging_tasks: dict[Any, Any] = {}
+    for rank, addr in worker_ranks.items():
+        key = (stage_name, rank)
+        staging_tasks[rank] = key
+        graph[key] = (
+            stage_results,
+            get_worker_context,
+            integration.stage_results,
+            allgather_id,
+            global_barrier_2_name,
+            options,
+        )
+        restricted_keys[key] = addr
+
+    # Add global barrier task
+    graph[global_barrier_3_name] = (
+        global_rmpf_barrier,
+        *staging_tasks.values(),
+    )
+
+    # Add result-staging tasks
+    for part_id in range(large_count):
+        key = (output_name, part_id)
+        graph[key] = (
+            join_chunk,
+            get_worker_context,
+            integration.join_chunk,
+            (large_name, part_id),
+            bcast_side,
+            allgather_id,
+            global_barrier_3_name,
+            options,
+        )
+
+    # TODO: How do we deal with cleanup??
+
+    # Tell the scheduler to restrict the worker-specific keys
     client._send_to_scheduler(
         {
             "op": "rmpf_add_restricted_tasks",

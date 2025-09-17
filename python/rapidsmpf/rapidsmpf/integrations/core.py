@@ -9,11 +9,12 @@ import weakref
 from dataclasses import dataclass, field
 from functools import partial
 from numbers import Number  # noqa: TC003
-from typing import TYPE_CHECKING, Any, ClassVar, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, TypeVar
 
 import rmm.mr
 from rmm.pylibrmm.stream import DEFAULT_STREAM
 
+from rapidsmpf.allgather import AllGather
 from rapidsmpf.buffer.buffer import MemoryType
 from rapidsmpf.buffer.resource import BufferResource, LimitAvailableMemory
 from rapidsmpf.buffer.spill_collection import SpillCollection
@@ -105,6 +106,10 @@ class WorkerContext:
         A collection of Python objects that can be spilled to free up device memory.
     shufflers
         A mapping from shuffler IDs to active shuffler instances.
+    allgathers
+        A mapping from allgather IDs to active allgather instances.
+    staged_results
+        A mapping from operation IDs to staged results.
     options
         Configuration options.
     """
@@ -116,6 +121,8 @@ class WorkerContext:
     statistics: Statistics
     spill_collection: SpillCollection = field(default_factory=SpillCollection)
     shufflers: dict[int, Shuffler] = field(default_factory=dict)
+    allgathers: dict[int, AllGather] = field(default_factory=dict)
+    staged_results: dict[int, list[Any]] = field(default_factory=dict)
     options: Options = field(default_factory=Options)
 
     def get_statistics(self) -> dict[str, dict[str, Number]]:
@@ -359,6 +366,274 @@ def extract_partition(
             with ctx.lock:
                 if shuffle_id in ctx.shufflers:
                     del ctx.shufflers[shuffle_id]
+
+
+class JoinIntegration(Protocol[DataFrameT]):
+    """Join-integration protocol."""
+
+    @staticmethod
+    def insert_chunk(
+        df: DataFrameT,
+        allgather: AllGather,
+        options: Any,
+    ) -> None:
+        """
+        Add a DataFrame chunk to a RapidsMPF AllGather operation.
+
+        Parameters
+        ----------
+        df
+            DataFrame partition to add to a RapidsMPF shuffler.
+        allgather
+            The RapidsMPF AllGather object to use.
+        options
+            Additional options.
+        """
+        ...
+
+    @staticmethod
+    def stage_results(
+        ctx: WorkerContext,
+        allgather_id: int,
+        options: Any,
+    ) -> int:
+        """
+        Stage the local results of a RapidsMPF AllGather.
+
+        Parameters
+        ----------
+        ctx
+            The worker context.
+        allgather_id
+            The RapidsMPF AllGather id.
+        options
+            Additional options.
+
+        Returns
+        -------
+        The number of local chunks.
+        """
+        ...
+
+    @staticmethod
+    def join_chunk(
+        ctx: WorkerContext,
+        large_table_chunk: DataFrameT,
+        bcast_side: Literal["left", "right"],
+        allgather_id: int,
+        options: Any,
+    ) -> int:
+        """
+        Perform a join operation on a chunk of the large table.
+
+        Parameters
+        ----------
+        ctx
+            The worker context.
+        large_table_chunk
+            The large-table chunk to join.
+        bcast_side
+            The side of the join being broadcasted.
+        allgather_id
+            The RapidsMPF AllGather id.
+        options
+            Additional options.
+
+        Returns
+        -------
+        The number of local chunks.
+        """
+        ...
+
+
+def get_allgather(
+    ctx: WorkerContext,
+    allgather_id: int,
+    *,
+    worker: Any = None,
+) -> AllGather:
+    """
+    Return the appropriate :class:`AllGather` object.
+
+    Parameters
+    ----------
+    ctx
+        The worker context.
+    allgather_id
+        Unique ID for the allgather operation.
+    worker
+        The current worker.
+
+    Returns
+    -------
+    The active RapidsMPF :class:`AllGather` object associated with
+    the specified ``allgather_id`` and ``worker``.
+
+    Notes
+    -----
+    Whenever a new :class:`AllGather` object is created, it is
+    saved as ``WorkerContext.allgathers[allgather_id]``.
+    """
+    with ctx.lock:
+        if allgather_id not in ctx.allgathers:
+            assert ctx.br is not None
+            assert ctx.comm is not None
+            assert ctx.progress_thread is not None
+            ctx.allgathers[allgather_id] = AllGather(
+                ctx.comm,
+                ctx.progress_thread,
+                op_id=allgather_id,
+                stream=DEFAULT_STREAM,
+                br=ctx.br,
+                statistics=ctx.statistics,
+            )
+        return ctx.allgathers[allgather_id]
+
+
+def get_staged_results(
+    ctx: WorkerContext,
+    operation_id: int,
+) -> list[Any]:
+    """Return a staged result."""
+    with ctx.lock:
+        return ctx.staged_results.get(operation_id, [])
+
+
+def add_staged_result(
+    ctx: WorkerContext,
+    operation_id: int,
+    value: Any,
+) -> None:
+    """Add a staged result."""
+    with ctx.lock:
+        if operation_id not in ctx.staged_results:
+            ctx.staged_results[operation_id] = []
+        ctx.staged_results[operation_id].append(value)
+
+
+def insert_chunk(
+    get_context: Callable[..., WorkerContext],
+    callback: Callable[
+        [
+            DataFrameT,
+            AllGather,
+            Any,
+        ],
+        None,
+    ],
+    df: DataFrameT,
+    allgather_id: int,
+    options: Any,
+) -> None:
+    """
+    Add a chunk to a RapidsMPF AllGather.
+
+    Parameters
+    ----------
+    get_context
+        Callable function to fetch the worker context.
+    callback
+        Insertion callback function. This function must be the
+        `insert_chunk` attribute of a `JoinIntegration`
+        protocol.
+    df
+        DataFrame chunk to add to a RapidsMPF allgather.
+    allgather_id
+        The RapidsMPF allgather id.
+    options
+        Optional key-word arguments.
+    """
+    callback(
+        df,
+        get_allgather(get_context(), allgather_id),
+        options,
+    )
+
+
+def stage_results(
+    get_context: Callable[..., WorkerContext],
+    callback: Callable[
+        [WorkerContext, int, Any],
+        int,
+    ],
+    allgather_id: int,
+    worker_barrier: tuple[int, ...],
+    options: Any,
+) -> int:
+    """
+    Stage the results of a RapidsMPF AllGather.
+
+    Parameters
+    ----------
+    get_context
+        Callable function to fetch the worker context.
+    callback
+        Staging callback function. This function must be the
+        `stage_results` attribute of a `JoinIntegration`
+        protocol.
+    allgather_id
+        The RapidsMPF allgather id.
+    worker_barrier
+        Worker-barrier task dependency. This value should
+        not be used for compute logic.
+    options
+        Additional options.
+
+    Returns
+    -------
+    The number of staged chunks.
+    """
+    return callback(
+        get_context(),
+        allgather_id,
+        options,
+    )
+
+
+def join_chunk(
+    get_context: Callable[..., WorkerContext],
+    callback: Callable[
+        [WorkerContext, DataFrameT, Literal["left", "right"], int, Any],
+        DataFrameT,
+    ],
+    large_table_chunk: DataFrameT,
+    bcast_side: Literal["left", "right"],
+    allgather_id: int,
+    worker_barrier: tuple[int, ...],
+    options: Any,
+) -> int:
+    """
+    Perform a join operation on a chunk of the large table.
+
+    Parameters
+    ----------
+    get_context
+        Callable function to fetch the worker context.
+    callback
+        Staging callback function. This function must be the
+        `join` attribute of a `JoinIntegration`
+        protocol.
+    allgather_id
+        The RapidsMPF allgather id.
+    worker_barrier
+        Worker-barrier task dependency. This value should
+        not be used for compute logic.
+    options
+        Additional options.
+
+    Returns
+    -------
+    The number of staged chunks.
+    """
+    ctx = get_context()
+
+    return callback(
+        ctx,
+        large_table_chunk,
+        bcast_side,
+        allgather_id,
+        options,
+    )
 
 
 # Create a spill function that spills the python objects in the spill-

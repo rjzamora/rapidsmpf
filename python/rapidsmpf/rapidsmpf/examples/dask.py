@@ -11,11 +11,14 @@ import numpy as np
 from dask.tokenize import tokenize
 from dask.utils import M
 
+import cudf
 from rmm.pylibrmm.stream import DEFAULT_STREAM
 
 import rapidsmpf.integrations.dask
 import rapidsmpf.integrations.single
+from rapidsmpf.buffer.packed_data import PackedData
 from rapidsmpf.config import Options
+from rapidsmpf.integrations.core import add_staged_result, get_staged_results
 from rapidsmpf.integrations.cudf.partition import (
     partition_and_pack,
     split_and_pack,
@@ -30,8 +33,7 @@ if TYPE_CHECKING:
 
     import dask_cudf
 
-    import cudf
-
+    from rapidsmpf.integrations.core import AllGather, WorkerContext
     from rapidsmpf.shuffler import Shuffler
 
 
@@ -154,6 +156,74 @@ class DaskCudfIntegration:
         )
 
 
+class DaskCudfJoinIntegration:
+    """Dask-cuDF protocol for Dask join integration."""
+
+    @staticmethod
+    def insert_chunk(
+        df: cudf.DataFrame,
+        allgather: AllGather,
+        options: dict[str, Any],
+    ) -> None:
+        from pylibcudf.contiguous_split import pack
+
+        ctx = rapidsmpf.integrations.dask.get_worker_context()
+        assert ctx.br is not None
+        packed_columns = pack(cudf_to_pylibcudf_table(df))
+        packed_data = PackedData.from_cudf_packed_columns(
+            packed_columns, DEFAULT_STREAM, ctx.br
+        )
+        allgather.insert(packed_data)
+
+    @staticmethod
+    def stage_results(
+        ctx: WorkerContext,
+        allgather_id: int,
+        options: dict[str, Any],
+    ) -> int:
+        from rapidsmpf.integrations.core import get_allgather
+        from rapidsmpf.integrations.cudf.partition import unpack_and_concat
+
+        column_names = options["column_names"]
+        allgather = get_allgather(ctx, allgather_id)
+        assert ctx.br is not None
+        results = allgather.wait_and_extract(ordered=False)
+        for result in results:
+            plc_table = unpack_and_concat([result], DEFAULT_STREAM, ctx.br)
+            add_staged_result(
+                ctx,
+                allgather_id,
+                # TODO: Add the staged data to the worker's SpillCollection
+                pylibcudf_to_cudf_dataframe(plc_table, column_names=column_names),
+            )
+
+    @staticmethod
+    def join_chunk(
+        ctx: WorkerContext,
+        large_table_chunk: cudf.DataFrame,
+        bcast_side: Literal["left", "right"],
+        allgather_id: int,
+        options: dict[str, Any],
+    ) -> cudf.DataFrame:
+        """Join a chunk of a Dask-cuDF DataFrame."""
+        results = []
+        for small_table_chunk_staged in get_staged_results(ctx, allgather_id):
+            # TODO: Handle unspilling?
+            small_table_chunk = small_table_chunk_staged
+            if bcast_side == "right":
+                left, right = (large_table_chunk, small_table_chunk)
+            else:
+                left, right = (small_table_chunk, large_table_chunk)
+
+            kwargs = {
+                "left_on": options["left_on"],
+                "right_on": options["right_on"],
+                "how": options["how"],
+            }
+            results.append(left.merge(right, **kwargs))
+        return cudf.concat(results)
+
+
 def dask_cudf_shuffle(
     df: dask_cudf.DataFrame,
     on: list[str],
@@ -270,3 +340,69 @@ def dask_cudf_shuffle(
         )
     else:
         return shuffled
+
+
+def dask_cudf_bcast_join(
+    left: dask_cudf.DataFrame,
+    right: dask_cudf.DataFrame,
+    left_on: list[str],
+    right_on: list[str],
+    *,
+    how: Literal["inner", "left", "right"] = "inner",
+    config_options: Options = Options(),
+) -> dask_cudf.DataFrame:
+    """Join two Dask-cuDF DataFrames with RapidsMPF."""
+    from rapidsmpf.integrations.dask.shuffler import (
+        rapidsmpf_bcast_join_graph as join_graph,
+    )
+
+    if how != "inner":
+        raise ValueError("Only 'inner' is supported for now.")
+
+    left0 = left.optimize()
+    right0 = right.optimize()
+    left_count_in = left0.npartitions
+    right_count_in = right0.npartitions
+
+    token = tokenize(left0, right0, left_on, right_on, how)
+    left_name_in = left0._name
+    right_name_in = right0._name
+    name_out = f"broadcast-join-{token}"
+
+    if right_count_in <= left_count_in and how != "right":
+        bcast_side = "right"
+        count_out = left_count_in
+        column_names = list(right0.columns)
+    else:
+        bcast_side = "left"
+        count_out = right_count_in
+        column_names = list(left0.columns)
+
+    join_graph_args = (
+        left_name_in,
+        right_name_in,
+        name_out,
+        bcast_side,
+        left_count_in,
+        right_count_in,
+        DaskCudfJoinIntegration,
+        {
+            "column_names": column_names,
+            "left_on": left_on,
+            "right_on": right_on,
+            "how": how,
+        },
+    )
+
+    graph = join_graph(*join_graph_args, config_options=config_options)
+    graph.update(left0.dask)
+    graph.update(right0.dask)
+
+    meta = left.merge(right, left_on=left_on, right_on=right_on, how=how)._meta
+    return dd.from_graph(
+        graph,
+        meta,
+        (None,) * (count_out + 1),
+        [(name_out, pid) for pid in range(count_out)],
+        "rapidsmpf",
+    )
