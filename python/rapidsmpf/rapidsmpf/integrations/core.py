@@ -37,17 +37,17 @@ if TYPE_CHECKING:
 DataFrameT = TypeVar("DataFrameT")
 
 
-# Set of available shuffle IDs
-_shuffle_id_vacancy: set[int] = set(range(Shuffler.max_concurrent_shuffles))
-_shuffle_id_vacancy_lock: threading.Lock = threading.Lock()
+# Set of available operation IDs
+_operation_id_vacancy: set[int] = set(range(Shuffler.max_concurrent_shuffles))
+_operation_id_vacancy_lock: threading.Lock = threading.Lock()
 
 
-def get_new_shuffle_id(get_occupied_ids: Callable[[], Sequence[set[int]]]) -> int:
+def get_new_operation_id(get_occupied_ids: Callable[[], Sequence[set[int]]]) -> int:
     """
-    Get a new available shuffle ID.
+    Get a new available operation ID.
 
     Since RapidsMPF only supports a limited number of shuffler instances at
-    any given time, this function maintains a shared pool of shuffle IDs.
+    any given time, this function maintains a shared pool of operation IDs.
 
     If no IDs are available locally, it calls get_occupied_ids to query all
     workers for IDs in use, updates the vacancy set accordingly, and retries.
@@ -56,32 +56,32 @@ def get_new_shuffle_id(get_occupied_ids: Callable[[], Sequence[set[int]]]) -> in
     Parameters
     ----------
     get_occupied_ids
-        Callable function that returns the occupied shuffle IDs.
+        Callable function that returns the occupied operation IDs.
 
     Returns
     -------
-    A unique shuffle ID not currently in use.
+    A unique operation ID not currently in use.
 
     Raises
     ------
     ValueError
-        If all shuffle IDs are currently in use.
+        If all operation IDs are currently in use.
     """
-    global _shuffle_id_vacancy  # noqa: PLW0603
+    global _operation_id_vacancy  # noqa: PLW0603
 
-    with _shuffle_id_vacancy_lock:
-        if not _shuffle_id_vacancy:
+    with _operation_id_vacancy_lock:
+        if not _operation_id_vacancy:
             # We start with setting all IDs as vacant and then subtract all
             # IDs occupied on any one worker.
-            _shuffle_id_vacancy = set(range(Shuffler.max_concurrent_shuffles))
-            _shuffle_id_vacancy.difference_update(*get_occupied_ids())
-            if not _shuffle_id_vacancy:
+            _operation_id_vacancy = set(range(Shuffler.max_concurrent_shuffles))
+            _operation_id_vacancy.difference_update(*get_occupied_ids())
+            if not _operation_id_vacancy:
                 raise ValueError(
                     f"Cannot shuffle more than {Shuffler.max_concurrent_shuffles} "
                     "times in a single query."
                 )
 
-        return _shuffle_id_vacancy.pop()
+        return _operation_id_vacancy.pop()
 
 
 @dataclass
@@ -105,11 +105,14 @@ class WorkerContext:
     spill_collection
         A collection of Python objects that can be spilled to free up device memory.
     shufflers
-        A mapping from shuffler IDs to active shuffler instances.
+        A mapping from operation IDs to active shuffler instances.
     allgathers
-        A mapping from allgather IDs to active allgather instances.
+        A mapping from operation IDs to active allgather instances.
     staged_results
         A mapping from operation IDs to staged results.
+    staged_results_task_count
+        A mapping from operation IDs to the number of tasks that
+        have accessed the staged results.
     options
         Configuration options.
     """
@@ -123,6 +126,7 @@ class WorkerContext:
     shufflers: dict[int, Shuffler] = field(default_factory=dict)
     allgathers: dict[int, AllGather] = field(default_factory=dict)
     staged_results: dict[int, list[Any]] = field(default_factory=dict)
+    staged_results_task_count: dict[int, int] = field(default_factory=dict)
     options: Options = field(default_factory=Options)
 
     def get_statistics(self) -> dict[str, dict[str, Number]]:
@@ -368,7 +372,7 @@ def extract_partition(
                     del ctx.shufflers[shuffle_id]
 
 
-class JoinIntegration(Protocol[DataFrameT]):
+class BcastJoinIntegration(Protocol[DataFrameT]):
     """Join-integration protocol."""
 
     @staticmethod
@@ -421,6 +425,7 @@ class JoinIntegration(Protocol[DataFrameT]):
         large_table_chunk: DataFrameT,
         bcast_side: Literal["left", "right"],
         allgather_id: int,
+        n_worker_chunks: int,
         options: Any,
     ) -> int:
         """
@@ -436,6 +441,9 @@ class JoinIntegration(Protocol[DataFrameT]):
             The side of the join being broadcasted.
         allgather_id
             The RapidsMPF AllGather id.
+        n_worker_chunks
+            The number of chunks to be joined on this worker.
+            This information is needed to clean up staged data.
         options
             Additional options.
 
@@ -493,10 +501,20 @@ def get_allgather(
 def get_staged_results(
     ctx: WorkerContext,
     operation_id: int,
+    total_task_count: int,
 ) -> list[Any]:
     """Return a staged result."""
     with ctx.lock:
-        return ctx.staged_results.get(operation_id, [])
+        results = ctx.staged_results.get(operation_id, [])
+        if operation_id not in ctx.staged_results_task_count:
+            ctx.staged_results_task_count[operation_id] = 0
+        ctx.staged_results_task_count[operation_id] += 1
+        if ctx.staged_results_task_count[operation_id] == total_task_count:
+            # Last task to access the staged results, clean it up.
+            del ctx.allgathers[operation_id]
+            del ctx.staged_results[operation_id]
+            del ctx.staged_results_task_count[operation_id]
+        return results
 
 
 def add_staged_result(
@@ -534,7 +552,7 @@ def insert_chunk(
         Callable function to fetch the worker context.
     callback
         Insertion callback function. This function must be the
-        `insert_chunk` attribute of a `JoinIntegration`
+        `insert_chunk` attribute of a `BcastJoinIntegration`
         protocol.
     df
         DataFrame chunk to add to a RapidsMPF allgather.
@@ -569,7 +587,7 @@ def stage_results(
         Callable function to fetch the worker context.
     callback
         Staging callback function. This function must be the
-        `stage_results` attribute of a `JoinIntegration`
+        `stage_results` attribute of a `BcastJoinIntegration`
         protocol.
     allgather_id
         The RapidsMPF allgather id.
@@ -599,6 +617,7 @@ def join_chunk(
     large_table_chunk: DataFrameT,
     bcast_side: Literal["left", "right"],
     allgather_id: int,
+    n_worker_chunks: int,
     worker_barrier: tuple[int, ...],
     options: Any,
 ) -> int:
@@ -611,10 +630,13 @@ def join_chunk(
         Callable function to fetch the worker context.
     callback
         Staging callback function. This function must be the
-        `join` attribute of a `JoinIntegration`
+        `join` attribute of a `BcastJoinIntegration`
         protocol.
     allgather_id
         The RapidsMPF allgather id.
+    n_worker_chunks
+        The number of chunks to be joined on this worker.
+        This information is needed to clean up staged data.
     worker_barrier
         Worker-barrier task dependency. This value should
         not be used for compute logic.
@@ -632,6 +654,7 @@ def join_chunk(
         large_table_chunk,
         bcast_side,
         allgather_id,
+        n_worker_chunks,
         options,
     )
 

@@ -11,7 +11,7 @@ from rapidsmpf.config import Options
 from rapidsmpf.integrations.core import (
     WorkerContext,
     extract_partition,
-    get_new_shuffle_id,
+    get_new_operation_id,
     get_shuffler,
     insert_partition,
     rmpf_worker_setup,
@@ -164,7 +164,7 @@ def rapidsmpf_shuffle_graph(
     setup_worker(config_options)
 
     # Get the shuffle id
-    shuffle_id = get_new_shuffle_id(_get_occupied_ids)
+    shuffle_id = get_new_operation_id(_get_occupied_ids)
     _stage_shuffle(shuffle_id, partition_count_out)
 
     # Define task names for each phase of the shuffle

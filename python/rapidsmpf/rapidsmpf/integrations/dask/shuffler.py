@@ -12,10 +12,10 @@ from distributed import get_worker
 
 from rapidsmpf.config import Options
 from rapidsmpf.integrations.core import (
-    JoinIntegration,
+    BcastJoinIntegration,
     extract_partition,
     get_allgather,
-    get_new_shuffle_id,
+    get_new_operation_id,
     get_shuffler,
     insert_chunk,
     insert_partition,
@@ -87,7 +87,7 @@ def _worker_rmpf_barrier(
 def _stage_shuffler(
     shuffle_id: int,
     partition_count: int,
-    worker: Worker | None = None,
+    dask_worker: Worker | None = None,
 ) -> None:
     """
     Stage a shuffler object without returning it.
@@ -98,28 +98,28 @@ def _stage_shuffler(
         Unique ID for the shuffle operation.
     partition_count
         Output partition count for the shuffle operation.
-    worker
+    dask_worker
         The current dask worker.
 
     Notes
     -----
     This function is expected to run on a Dask worker.
     """
-    worker = worker or get_worker()
+    dask_worker = dask_worker or get_worker()
     get_shuffler(
-        get_worker_context(worker),
+        get_worker_context(dask_worker),
         shuffle_id,
         partition_count=partition_count,
-        worker=worker,
+        worker=dask_worker,
     )
 
 
 def _stage_allgather(
     allgather_id: int,
-    worker: Worker | None = None,
+    dask_worker: Worker | None = None,
 ) -> None:
-    worker = worker or get_worker()
-    get_allgather(get_worker_context(worker), allgather_id, worker=worker)
+    dask_worker = dask_worker or get_worker()
+    get_allgather(get_worker_context(dask_worker), allgather_id, worker=dask_worker)
 
 
 def _get_dask_worker_ranks_and_stage_operation(
@@ -235,7 +235,7 @@ def rapidsmpf_shuffle_graph(
     """
     # Get the shuffle id
     client = get_dask_client(options=config_options)
-    shuffle_id = get_new_shuffle_id(partial(_get_occupied_ids_dask, client))
+    shuffle_id = get_new_operation_id(partial(_get_occupied_ids_dask, client))
 
     # Note: We've observed high overhead from `Client.run` on some systems with
     # some networking configurations. Minimize the number of `Client.run` calls
@@ -337,7 +337,7 @@ def rapidsmpf_bcast_join_graph(
     bcast_side: Literal["left", "right"],
     left_partition_count_in: int,
     right_partition_count_in: int,
-    integration: JoinIntegration,
+    integration: BcastJoinIntegration,
     options: Any,
     config_options: Options = Options(),
 ) -> dict[Any, Any]:
@@ -345,7 +345,7 @@ def rapidsmpf_bcast_join_graph(
     # Get the shuffle id
     client = get_dask_client(options=config_options)
     # TODO: Use allgather id
-    allgather_id = get_new_shuffle_id(partial(_get_occupied_ids_dask, client))
+    allgather_id = get_new_operation_id(partial(_get_occupied_ids_dask, client))
     if bcast_side == "right":
         small_name = right_name
         large_name = left_name
@@ -370,6 +370,7 @@ def rapidsmpf_bcast_join_graph(
             operation="allgather",
         ).items()
     }
+    n_workers = len(worker_ranks)
     restricted_keys: MutableMapping[Any, str] = {}
 
     # Define task names for each phase of the broadcast join
@@ -439,8 +440,17 @@ def rapidsmpf_bcast_join_graph(
         *staging_tasks.values(),
     )
 
-    # Add result-staging tasks
+    # Add join tasks
     for part_id in range(large_count):
+        # NOTE: We pin tasks to specific workers
+        # to ensure that we can clean up staged data.
+        # Unfortunately, cleanup becomes a headache
+        # when the join can run on any worker.
+        # TODO: Can we find a better solution?
+        rank = part_id % n_workers
+        n_worker_tasks = large_count // n_workers + int(
+            rank < (large_count % n_workers)
+        )
         key = (output_name, part_id)
         graph[key] = (
             join_chunk,
@@ -449,11 +459,11 @@ def rapidsmpf_bcast_join_graph(
             (large_name, part_id),
             bcast_side,
             allgather_id,
+            n_worker_tasks,
             global_barrier_3_name,
             options,
         )
-
-    # TODO: How do we deal with cleanup??
+        restricted_keys[key] = worker_ranks[rank]
 
     # Tell the scheduler to restrict the worker-specific keys
     client._send_to_scheduler(
