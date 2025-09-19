@@ -17,8 +17,8 @@ from rmm.pylibrmm.stream import DEFAULT_STREAM
 
 import rapidsmpf.integrations.dask
 import rapidsmpf.integrations.single
+from rapidsmpf.buffer.packed_data import PackedData
 from rapidsmpf.config import Options
-from rapidsmpf.integrations.core import PackedData
 from rapidsmpf.integrations.cudf.partition import (
     partition_and_pack,
     split_and_pack,
