@@ -12,11 +12,13 @@ from dask.tokenize import tokenize
 from dask.utils import M
 
 import cudf
+import pylibcudf as plc
 from rmm.pylibrmm.stream import DEFAULT_STREAM
 
 import rapidsmpf.integrations.dask
 import rapidsmpf.integrations.single
 from rapidsmpf.config import Options
+from rapidsmpf.integrations.core import PackedData
 from rapidsmpf.integrations.cudf.partition import (
     partition_and_pack,
     split_and_pack,
@@ -32,7 +34,10 @@ if TYPE_CHECKING:
 
     import dask_cudf
 
-    from rapidsmpf.integrations.core import ShufflerIntegration
+    from rapidsmpf.integrations.core import (
+        ShufflerIntegration,
+        WorkerContext,
+    )
     from rapidsmpf.shuffler import Shuffler
 
 
@@ -288,11 +293,91 @@ class DaskCudfJoinIntegration:
         return DaskCudfIntegration()
 
     @staticmethod
+    def pack_partition(
+        ctx: WorkerContext, data: cudf.DataFrame, options: Any
+    ) -> PackedData:
+        """Pack a partition for broadcasting."""
+        packed_columns = plc.contiguous_split.pack(cudf_to_pylibcudf_table(data))
+        return PackedData.from_cudf_packed_columns(
+            packed_columns, DEFAULT_STREAM, ctx.br
+        )
+
+    @staticmethod
+    def unpack_partition(
+        ctx: WorkerContext, data: PackedData, options: Any
+    ) -> cudf.DataFrame:
+        """Unpack a finished partition from the RMPF shuffler."""
+        column_names = options["column_names"]
+        plc_table = unpack_and_concat(
+            unspill_partitions(
+                [data],
+                br=ctx.br,
+                allow_overbooking=True,
+                statistics=ctx.statistics,
+            ),
+            br=ctx.br,
+            stream=DEFAULT_STREAM,
+        )
+        return pylibcudf_to_cudf_dataframe(plc_table, column_names=column_names)
+
+    @staticmethod
+    def local_repartition(
+        get_worker_context: Callable[..., WorkerContext],
+        data: cudf.DataFrame,
+        partition_count: int,
+        options: Any,
+    ) -> dict[int, cudf.DataFrame]:
+        """
+        Break a single DataFrame partition into multiple local partitions.
+
+        Parameters
+        ----------
+        get_worker_context
+            Callable function to fetch the worker context.
+        data
+            The local DataFrame partition.
+        partition_count
+            The number of local partitions to generate.
+        options
+            Additional options.
+
+        Returns
+        -------
+        A dictionary of DataFrame partitions.
+        The keys are the partition ids.
+        The values are the DataFrame partitions.
+        """
+        # partition for each row
+        partition_map = plc.binaryop.binary_operation(
+            plc.hashing.murmurhash3_x86_32(
+                cudf_to_pylibcudf_table(data[options["on"]])
+            ),
+            plc.Scalar.from_py(partition_count, plc.DataType(plc.TypeId.UINT32)),
+            plc.binaryop.BinaryOperator.PYMOD,
+            plc.types.DataType(plc.types.TypeId.UINT32),
+        )
+
+        # Apply partitioning
+        t, offsets = plc.partitioning.partition(
+            cudf_to_pylibcudf_table(data),
+            partition_map,
+            partition_count,
+        )
+        splits = offsets[1:-1]
+
+        # Split and return the partitioned result
+        column_names = options["column_names"]
+        return {
+            i: pylibcudf_to_cudf_dataframe(split, column_names=column_names)
+            for i, split in enumerate(plc.copying.split(t, splits))
+        }
+
+    @staticmethod
     def join_partition(
-        left_input: cudf.DataFrame | Callable[[int], cudf.DataFrame],
-        right_input: cudf.DataFrame | Callable[[int], cudf.DataFrame],
+        left_input: Callable[[int], cudf.DataFrame],
+        right_input: Callable[[int], cudf.DataFrame],
         bcast_side: Literal["left", "right", "none"],
-        bcast_count: int | None,
+        bcast_count: int,
         options: Any,
     ) -> cudf.DataFrame:
         """
@@ -314,7 +399,6 @@ class DaskCudfJoinIntegration:
             The side of the join being broadcasted (if either).
         bcast_count
             The number of broadcasted chunks.
-            Ignored unless ``bcast_side`` is "left" or "right".
         options
             Additional join options.
 
@@ -326,22 +410,26 @@ class DaskCudfJoinIntegration:
         -----
         This method is used to produce a single joined table chunk.
         """
-        if bcast_side != "none":  # pragma: no cover
-            raise NotImplementedError("Broadcast join not implemented.")
+        if bcast_side not in ("left", "right", "none"):  # pragma: no cover
+            raise ValueError(
+                f"Expected one of 'left', 'right', or 'none'. Got {bcast_side}"
+            )
 
-        # Broadcast joins are not supported yet, so the input must be a cudf.DataFrame.
-        assert isinstance(left_input, cudf.DataFrame), "Expected cudf.DataFrame"
-        assert isinstance(right_input, cudf.DataFrame), "Expected cudf.DataFrame"
-        left = left_input
-        right = right_input
-
-        # Return merged result
-        kwargs = {
+        join_kwargs = {
             "left_on": options["left_on"],
             "right_on": options["right_on"],
             "how": options["how"],
         }
-        return left.merge(right, **kwargs)
+
+        if bcast_side == "none" or bcast_count < 2:
+            return left_input(0).merge(right_input(0), **join_kwargs)
+        else:
+            return cudf.concat(
+                [
+                    left_input(i).merge(right_input(i), **join_kwargs)
+                    for i in range(bcast_count)
+                ]
+            )
 
 
 def dask_cudf_join(
@@ -351,7 +439,7 @@ def dask_cudf_join(
     right_on: list[str],
     *,
     how: Literal["inner", "left", "right"] = "inner",
-    bcast_side: Literal["left", "right", "none"] = "none",
+    bcast_limit: int = 8,
     left_pre_shuffled: bool = False,
     right_pre_shuffled: bool = False,
     cluster_kind: Literal["distributed", "single", "auto"] = "auto",
@@ -373,10 +461,8 @@ def dask_cudf_join(
     how
         The type of join to perform.
         Options are ``{'inner', 'left', 'right'}``.
-    bcast_side
-        The side of the join to broadcast (if either).
-        Options are ``{'left', 'right', 'none'}``.
-        Note: Only ``'none'`` is supported for now.
+    bcast_limit
+        The maximum number of partitions to broadcast.
     left_pre_shuffled
         Whether the left collection is already shuffled.
     right_pre_shuffled
@@ -399,21 +485,54 @@ def dask_cudf_join(
     This API is currently intended for demonstration and
     testing purposes only.
     """
-    if bcast_side != "none":  # pragma: no cover
-        # TODO: Support broadcast joins.
-        raise ValueError("Only bcast_side='none' is supported for now.")
-
     if (cluster_kind := _get_cluster_kind(cluster_kind)) == "distributed":
         from rapidsmpf.integrations.dask.join import rapidsmpf_join_graph
     else:  # pragma: no cover
         # TODO: Support single-worker joins.
         raise NotImplementedError("Single-worker join not implemented.")
 
+    # Optimize the input DataFrames to freeze their partition counts
     left0 = left.optimize()
     right0 = right.optimize()
     left_partition_count_in = left0.npartitions
     right_partition_count_in = right0.npartitions
 
+    # Define bcast_side and shuffle the broadcasted table (if necessary)
+    bcast_side: Literal["left", "right", "none"] = "none"
+    need_local_repartition = False
+    npartitions_out = max(left_partition_count_in, right_partition_count_in)
+    if (
+        left_partition_count_in == npartitions_out
+        and right_partition_count_in <= bcast_limit
+        and how in ("left", "inner")
+    ):
+        bcast_side = "right"
+        need_local_repartition = how != "inner"
+        if need_local_repartition and not right_pre_shuffled:
+            right0 = dask_cudf_shuffle(
+                right0,
+                right_on,
+                partition_count=right0.npartitions,
+                cluster_kind=cluster_kind,
+                config_options=config_options,
+            )
+    elif (
+        right_partition_count_in == npartitions_out
+        and left_partition_count_in <= bcast_limit
+        and how in ("right", "inner")
+    ):
+        bcast_side = "left"
+        need_local_repartition = how != "inner"
+        if need_local_repartition and not left_pre_shuffled:
+            left0 = dask_cudf_shuffle(
+                left0,
+                left_on,
+                partition_count=left0.npartitions,
+                cluster_kind=cluster_kind,
+                config_options=config_options,
+            )
+
+    # Build the task graph
     token = tokenize(left0, right0, left_on, bcast_side, right_on, how)
     left_name_in = left0._name
     right_name_in = right0._name
@@ -439,6 +558,7 @@ def dask_cudf_join(
             "how": how,
         },
         bcast_side=bcast_side,
+        need_local_repartition=need_local_repartition,
         left_pre_shuffled=left_pre_shuffled,
         right_pre_shuffled=right_pre_shuffled,
         config_options=config_options,
@@ -446,6 +566,7 @@ def dask_cudf_join(
     graph.update(left0.dask)
     graph.update(right0.dask)
 
+    # Build and return the output DataFrame collection
     meta = left0.merge(right0, left_on=left_on, right_on=right_on, how=how)._meta
     count_out = max(left_partition_count_in, right_partition_count_in)
     return dd.from_graph(

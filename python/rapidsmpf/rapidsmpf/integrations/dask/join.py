@@ -4,19 +4,81 @@
 
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING, Any, Literal
 
+from distributed import get_worker
+
 from rapidsmpf.config import Options
-from rapidsmpf.integrations.core import join_partition
+from rapidsmpf.integrations.core import (
+    bcast_partition,
+    get_allgather,
+    get_new_shuffle_id,
+    join_partition,
+    stage_partitions,
+)
 from rapidsmpf.integrations.dask.core import (
     get_dask_client,
     get_dask_worker_rank,
     get_worker_context,
+    global_rmpf_barrier,
 )
-from rapidsmpf.integrations.dask.shuffler import _partial_shuffle_graph
+from rapidsmpf.integrations.dask.shuffler import (
+    _get_occupied_ids_dask,
+    _partial_shuffle_graph,
+)
 
 if TYPE_CHECKING:
+    from distributed import Worker
+
     from rapidsmpf.integrations.core import JoinIntegration
+
+
+def _stage_allgather(
+    allgather_id: int,
+    dask_worker: Worker | None = None,
+) -> None:
+    """
+    Stage an allgather object without returning it.
+
+    Parameters
+    ----------
+    allgather_id
+        Unique ID for the allgather operation.
+    dask_worker
+        The current dask worker.
+
+    Notes
+    -----
+    This function is expected to run on a Dask worker.
+    """
+    dask_worker = dask_worker or get_worker()
+    get_allgather(
+        get_worker_context(dask_worker),
+        allgather_id,
+        worker=dask_worker,
+    )
+
+
+def _worker_allgather_barrier(allgather_id: int, dependency: None) -> None:
+    """
+    Worker barrier for RapidsMPF allgather.
+
+    Parameters
+    ----------
+    allgather_id
+        Unique ID for the allgather operation.
+    dependency
+        Null argument used to enforce barrier dependencies.
+
+    Notes
+    -----
+    A worker barrier task DOES need to be restricted
+    to a specific Dask worker.
+    """
+    ctx = get_worker_context()
+    with ctx.lock:
+        get_allgather(ctx, allgather_id).insert_finished()
 
 
 def rapidsmpf_join_graph(
@@ -31,6 +93,7 @@ def rapidsmpf_join_graph(
     join_options: Any,
     *,
     bcast_side: Literal["left", "right", "none"] = "none",
+    need_local_repartition: bool = False,
     left_pre_shuffled: bool = False,
     right_pre_shuffled: bool = False,
     config_options: Options = Options(),
@@ -62,6 +125,8 @@ def rapidsmpf_join_graph(
         The side of the join being broadcasted.
         Options are ``{'left', 'right', 'none'}``.
         Note: Only ``'none'`` is supported for now.
+    need_local_repartition
+        Whether the join needs local repartitioning.
     left_pre_shuffled
         Whether the left table is already shuffled.
     right_pre_shuffled
@@ -88,12 +153,11 @@ def rapidsmpf_join_graph(
     left_op_id: int | None = None
     right_op_id: int | None = None
 
+    # Determine the number of partitions in the output table
+    partition_count_out = max(left_partition_count_in, right_partition_count_in)
+
     if bcast_side == "none":
         # Regular hash join
-        bcast_count = None
-
-        # Determine the number of partitions in the output table
-        partition_count_out = max(left_partition_count_in, right_partition_count_in)
 
         # Shuffle left side (if necessary)
         if not left_pre_shuffled or left_partition_count_in != partition_count_out:
@@ -139,7 +203,8 @@ def rapidsmpf_join_graph(
                 get_worker_context,
                 integration,
                 bcast_side,
-                bcast_count,
+                0,
+                need_local_repartition,
                 left_op_id,
                 right_op_id,
                 left_barrier_name or (left_name, part_id),
@@ -154,10 +219,116 @@ def rapidsmpf_join_graph(
             restricted_keys[key] = worker_ranks[rank]
 
     elif bcast_side in ["left", "right"]:  # pragma: no cover
-        # TODO: Broadcast join
-        raise NotImplementedError("Broadcast join is not yet implemented.")
+        # Get the operation id and stage the allgather operation
+        allgather_id = get_new_shuffle_id(partial(_get_occupied_ids_dask, client))
+        client.run(_stage_allgather, allgather_id)
+
+        # Define task names for each phase of the broadcast join
+        insert_name = f"bcast-insert-{output_name}"
+        stage_name = f"bcast-stage-{output_name}"
+        global_barrier_1_name = f"bcast-global-barrier-1-{output_name}"
+        global_barrier_2_name = f"bcast-global-barrier-2-{output_name}"
+        global_barrier_3_name = f"bcast-global-barrier-3-{output_name}"
+        worker_barrier_name = f"bcast-worker-barrier-{output_name}"
+        if bcast_side == "right":
+            small_name = right_name
+            small_count = right_partition_count_in
+            bcast_options = right_options
+        else:
+            small_name = left_name
+            small_count = left_partition_count_in
+            bcast_options = left_options
+
+        # Add tasks to broadcast each small-table partition
+        insertion_keys: list[tuple[str, int]] = []
+        for pid in range(small_count):
+            key = (insert_name, pid)
+            graph[key] = (
+                bcast_partition,
+                get_worker_context,
+                integration.pack_partition,
+                (small_name, pid),
+                allgather_id,
+                bcast_options,
+            )
+            insertion_keys.append(key)
+
+        # Add global barrier task
+        graph[global_barrier_1_name] = (
+            global_rmpf_barrier,
+            *insertion_keys,
+        )
+
+        # Add worker barrier tasks
+        worker_barriers: list[tuple[str, int]] = []
+        for rank, addr in worker_ranks.items():
+            key = (worker_barrier_name, rank)
+            graph[key] = (
+                _worker_allgather_barrier,
+                allgather_id,
+                global_barrier_1_name,
+            )
+            restricted_keys[key] = addr
+            worker_barriers.append(key)
+
+        # Add global barrier task
+        graph[global_barrier_2_name] = (
+            global_rmpf_barrier,
+            *worker_barriers,
+        )
+
+        # Add staging tasks
+        staging_tasks: list[tuple[str, int]] = []
+        for rank, addr in worker_ranks.items():
+            key = (stage_name, rank)
+            graph[key] = (
+                stage_partitions,
+                get_worker_context,
+                integration.unpack_partition,
+                allgather_id,
+                bcast_options,
+                global_barrier_2_name,
+            )
+            staging_tasks.append(key)
+            restricted_keys[key] = addr
+
+        # Add global barrier task
+        graph[global_barrier_3_name] = (
+            global_rmpf_barrier,
+            *staging_tasks,
+        )
+
+        # Add join tasks
+        for part_id in range(partition_count_out):
+            rank = part_id % n_workers
+            n_worker_tasks = partition_count_out // n_workers + int(
+                rank < (partition_count_out % n_workers)
+            )
+            key = (output_name, part_id)
+            graph[key] = (
+                join_partition,
+                get_worker_context,
+                integration,
+                bcast_side,
+                small_count,
+                need_local_repartition,
+                allgather_id if bcast_side == "left" else left_op_id,
+                allgather_id if bcast_side == "right" else right_op_id,
+                global_barrier_3_name if bcast_side == "left" else (left_name, part_id),
+                global_barrier_3_name
+                if bcast_side == "right"
+                else (right_name, part_id),
+                part_id,
+                n_worker_tasks,
+                left_options,
+                right_options,
+                join_options,
+            )
+            # Assume round-robin partition assignment
+            restricted_keys[key] = worker_ranks[rank]
+
     else:  # pragma: no cover
-        raise ValueError(f"Invalid broadcast side: {bcast_side}")
+        raise ValueError(f"Invalid bcast_side: {bcast_side}")
 
     # Tell the scheduler to restrict the worker-specific keys
     client._send_to_scheduler(

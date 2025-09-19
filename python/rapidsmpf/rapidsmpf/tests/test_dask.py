@@ -200,6 +200,7 @@ def test_many_shuffles(loop: pytest.FixtureDef) -> None:  # noqa: F811
             if ctx.shufflers[shuffle_id].finished():
                 del ctx.shufflers[shuffle_id]
             else:
+                assert isinstance(shuffler, Shuffler), "Expected Shuffler"
                 shuffler.shutdown()
                 del ctx.shufflers[shuffle_id]
 
@@ -362,6 +363,7 @@ def test_many_shuffles_single() -> None:
         if context.shufflers[shuffle_id].finished():
             del context.shufflers[shuffle_id]
         else:
+            assert isinstance(shuffler, Shuffler), "Expected Shuffler"
             shuffler.shutdown()
             del context.shufflers[shuffle_id]
 
@@ -423,11 +425,13 @@ def test_clear_shuffle_statistics() -> None:
 @pytest.mark.parametrize("how", ["inner", "left", "right"])
 @pytest.mark.parametrize("left_pre_shuffled", [True, False])
 @pytest.mark.parametrize("right_pre_shuffled", [True, False])
+@pytest.mark.parametrize("bcast_limit", [1, 5])
 def test_dask_cudf_join(
     loop: pytest.FixtureDef,  # noqa: F811
     how: Literal["inner", "left", "right"],
     left_pre_shuffled: bool,  # noqa: FBT001
     right_pre_shuffled: bool,  # noqa: FBT001
+    bcast_limit: int,
 ) -> None:
     # Test basic Dask-cuDF unified join integration
     pytest.importorskip("dask_cudf")
@@ -493,6 +497,7 @@ def test_dask_cudf_join(
                 left_on=left_on,
                 right_on=right_on,
                 how=how,
+                bcast_limit=bcast_limit,
                 left_pre_shuffled=left_pre_shuffled,
                 right_pre_shuffled=right_pre_shuffled,
             ).compute()
