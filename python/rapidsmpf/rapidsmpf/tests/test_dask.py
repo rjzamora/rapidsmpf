@@ -436,6 +436,9 @@ def test_dask_cudf_join(
     # Test basic Dask-cuDF unified join integration
     pytest.importorskip("dask_cudf")
 
+    lg_kwargs = {"freq": "3600s", "partition_freq": "2D"}
+    sm_kwargs = {"freq": "360s", "partition_freq": "15D"}
+
     with LocalCUDACluster(loop=loop) as cluster:  # noqa: SIM117
         with Client(cluster) as client:
             bootstrap_dask_cluster(
@@ -443,16 +446,18 @@ def test_dask_cudf_join(
             )
             left0 = (
                 dask.datasets.timeseries(
-                    freq="3600s",
-                    partition_freq="2D",
+                    **(
+                        lg_kwargs
+                        if bcast_limit == 1 or how in ("left", "inner")
+                        else sm_kwargs
+                    )
                 )
                 .reset_index(drop=True)
                 .to_backend("cudf")
             )
             right0 = (
                 dask.datasets.timeseries(
-                    freq="360s",
-                    partition_freq="15D",
+                    **(lg_kwargs if bcast_limit > 5 and how == "right" else sm_kwargs)
                 )
                 .reset_index(drop=True)
                 .to_backend("cudf")
