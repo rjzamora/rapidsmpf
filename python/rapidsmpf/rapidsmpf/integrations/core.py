@@ -479,7 +479,6 @@ class JoinIntegration(Protocol[DataFrameT]):
 
     @staticmethod
     def local_repartition(
-        get_worker_context: Callable[..., WorkerContext],
         data: DataFrameT,
         partition_count: int,
         options: Any,
@@ -489,8 +488,6 @@ class JoinIntegration(Protocol[DataFrameT]):
 
         Parameters
         ----------
-        get_worker_context
-            Callable function to fetch the worker context.
         data
             The local DataFrame partition.
         partition_count
@@ -539,32 +536,62 @@ class JoinIntegration(Protocol[DataFrameT]):
 
 def bcast_partition(
     get_worker_context: Callable[..., WorkerContext],
-    pack_partition: Callable[[WorkerContext, DataFrameT, Any], PackedData],
+    integration: JoinIntegration[DataFrameT],
     partition: DataFrameT,
     allgather_id: int,
     options: Any,
 ) -> None:
-    """Broadcast a partition to all workers."""
+    """
+    Broadcast a partition to all workers.
+
+    Parameters
+    ----------
+    get_worker_context
+        Callable function to fetch the worker context.
+    integration
+        The JoinIntegration protocol to use.
+    partition
+        The partition to broadcast.
+    allgather_id
+        The allgather id.
+    options
+        Additional options.
+    """
     ctx = get_worker_context()
     with ctx.lock:
         allgather = get_allgather(ctx, allgather_id)
-        allgather.insert(pack_partition(ctx, partition, options))
+        allgather.insert(integration.pack_partition(ctx, partition, options))
 
 
 def stage_partitions(
     get_worker_context: Callable[..., WorkerContext],
-    unpack_partition: Callable[[WorkerContext, PackedData, Any], DataFrameT],
+    integration: JoinIntegration[DataFrameT],
     allgather_id: int,
     options: Any,
     barrier: Any,
 ) -> None:
-    """Stage broadcasted partitions for a broadcast join."""
+    """
+    Stage broadcasted partitions for a broadcast join.
+
+    Parameters
+    ----------
+    get_worker_context
+        Callable function to fetch the worker context.
+    integration
+        The JoinIntegration protocol to use.
+    allgather_id
+        The allgather id.
+    options
+        Additional options.
+    barrier
+        The global broadcast join barrier.
+    """
     ctx = get_worker_context()
     with ctx.lock:
         allgather = get_allgather(ctx, allgather_id)
         ordered = options.get("ordered", True)
         ctx.staged_data[allgather_id] = [
-            unpack_partition(ctx, data, options)
+            integration.unpack_partition(ctx, data, options)
             for data in allgather.wait_and_extract(ordered=ordered)
         ]
         for data in ctx.staged_data[allgather_id]:
@@ -575,7 +602,7 @@ def stage_partitions(
             ctx.staged_data_access_counts[allgather_id] = 0
 
 
-class GetPartition:
+class GetPartition(Protocol):
     """Base class for getting a partition for a join."""
 
     def __call__(self, partition_id: int) -> Any:  # pragma: no cover
@@ -665,9 +692,7 @@ class GetOtherPartition(GetPartition):
                             del ctx.shufflers[op_id]
 
         if broadcast_count > 1 and need_local_repartition:
-            self.data = integration.local_repartition(
-                get_worker_context, data, broadcast_count, options
-            )
+            self.data = integration.local_repartition(data, broadcast_count, options)
         else:
             self.data = {0: data}
         self.broadcast_count = broadcast_count
@@ -679,7 +704,6 @@ class GetOtherPartition(GetPartition):
             return self.data[partition_id]
         else:
             return self.data[0]
-        return self.data
 
 
 def join_partition(

@@ -161,7 +161,7 @@ class DaskCudfIntegration:
 
 def _get_cluster_kind(
     cluster_kind: Literal["distributed", "single", "auto"],
-) -> Literal["distributed", "single", "auto"]:
+) -> Literal["distributed", "single"]:
     """Validate and return the kind of cluster to use."""
     if cluster_kind not in ("distributed", "single", "auto"):
         raise ValueError(
@@ -322,7 +322,6 @@ class DaskCudfJoinIntegration:
 
     @staticmethod
     def local_repartition(
-        get_worker_context: Callable[..., WorkerContext],
         data: cudf.DataFrame,
         partition_count: int,
         options: Any,
@@ -332,8 +331,6 @@ class DaskCudfJoinIntegration:
 
         Parameters
         ----------
-        get_worker_context
-            Callable function to fetch the worker context.
         data
             The local DataFrame partition.
         partition_count
@@ -508,14 +505,6 @@ def dask_cudf_join(
     ):
         bcast_side = "right"
         need_local_repartition = how != "inner"
-        if need_local_repartition and not right_pre_shuffled:
-            right0 = dask_cudf_shuffle(
-                right0,
-                right_on,
-                partition_count=right0.npartitions,
-                cluster_kind=cluster_kind,
-                config_options=config_options,
-            )
     elif (
         right_partition_count_in == npartitions_out
         and left_partition_count_in <= bcast_limit
@@ -523,14 +512,6 @@ def dask_cudf_join(
     ):
         bcast_side = "left"
         need_local_repartition = how != "inner"
-        if need_local_repartition and not left_pre_shuffled:
-            left0 = dask_cudf_shuffle(
-                left0,
-                left_on,
-                partition_count=left0.npartitions,
-                cluster_kind=cluster_kind,
-                config_options=config_options,
-            )
 
     # Build the task graph
     token = tokenize(left0, right0, left_on, bcast_side, right_on, how)

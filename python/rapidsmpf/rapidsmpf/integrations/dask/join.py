@@ -26,6 +26,7 @@ from rapidsmpf.integrations.dask.core import (
 from rapidsmpf.integrations.dask.shuffler import (
     _get_occupied_ids_dask,
     _partial_shuffle_graph,
+    rapidsmpf_shuffle_graph,
 )
 
 if TYPE_CHECKING:
@@ -127,6 +128,11 @@ def rapidsmpf_join_graph(
         Note: Only ``'none'`` is supported for now.
     need_local_repartition
         Whether the join needs local repartitioning.
+        The small-table will be shuffled (if it was not
+        pre-shuffled) before being broadcasted, and each
+        partition of the large table will be locally
+        repartitioned before the join. This option
+        should be set to ``False`` for inner joins.
     left_pre_shuffled
         Whether the left table is already shuffled.
     right_pre_shuffled
@@ -219,6 +225,35 @@ def rapidsmpf_join_graph(
             restricted_keys[key] = worker_ranks[rank]
 
     elif bcast_side in ["left", "right"]:  # pragma: no cover
+        # Pre-shuffle small table (if necessary)
+        if need_local_repartition and (
+            (bcast_side == "right" and not right_pre_shuffled)
+            or (bcast_side == "left" and not left_pre_shuffled)
+        ):
+            # TODO: Use _partial_shuffle_graph instead (if practical)
+            new_name = f"rmpf-shuffle-small-{output_name}"
+            if bcast_side == "right":
+                input_name = right_name
+                right_name = new_name
+                partition_count_in = right_partition_count_in
+                options = right_options
+            else:
+                input_name = left_name
+                left_name = new_name
+                partition_count_in = left_partition_count_in
+                options = left_options
+
+            small_shuffle_graph = rapidsmpf_shuffle_graph(
+                input_name,
+                new_name,
+                partition_count_in,
+                partition_count_in,
+                integration.get_shuffler_integration(),
+                options,
+                config_options=config_options,
+            )
+            graph.update(small_shuffle_graph)
+
         # Get the operation id and stage the allgather operation
         allgather_id = get_new_shuffle_id(partial(_get_occupied_ids_dask, client))
         client.run(_stage_allgather, allgather_id)
@@ -246,7 +281,7 @@ def rapidsmpf_join_graph(
             graph[key] = (
                 bcast_partition,
                 get_worker_context,
-                integration.pack_partition,
+                integration,
                 (small_name, pid),
                 allgather_id,
                 bcast_options,
@@ -284,7 +319,7 @@ def rapidsmpf_join_graph(
             graph[key] = (
                 stage_partitions,
                 get_worker_context,
-                integration.unpack_partition,
+                integration,
                 allgather_id,
                 bcast_options,
                 global_barrier_2_name,
