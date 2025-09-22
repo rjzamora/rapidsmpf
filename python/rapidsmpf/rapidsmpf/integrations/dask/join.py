@@ -11,6 +11,7 @@ from distributed import get_worker
 
 from rapidsmpf.config import Options
 from rapidsmpf.integrations.core import (
+    BCastJoinInfo,
     bcast_partition,
     get_allgather,
     get_new_shuffle_id,
@@ -198,6 +199,7 @@ def rapidsmpf_join_graph(
             graph.update(right_graph)
 
         # Add basic hash-join tasks
+        bcast_info = BCastJoinInfo()  # Not a broadcast join
         for part_id in range(partition_count_out):
             rank = part_id % n_workers
             n_worker_tasks = partition_count_out // n_workers + int(
@@ -208,9 +210,7 @@ def rapidsmpf_join_graph(
                 join_partition,
                 get_worker_context,
                 integration,
-                bcast_side,
-                0,
-                need_local_repartition,
+                bcast_info,
                 left_op_id,
                 right_op_id,
                 left_barrier_name or (left_name, part_id),
@@ -334,6 +334,11 @@ def rapidsmpf_join_graph(
         )
 
         # Add join tasks
+        bcast_info = BCastJoinInfo(
+            bcast_side=bcast_side,
+            bcast_count=small_count,
+            need_local_repartition=need_local_repartition,
+        )
         for part_id in range(partition_count_out):
             rank = part_id % n_workers
             n_worker_tasks = partition_count_out // n_workers + int(
@@ -344,9 +349,7 @@ def rapidsmpf_join_graph(
                 join_partition,
                 get_worker_context,
                 integration,
-                bcast_side,
-                small_count,
-                need_local_repartition,
+                bcast_info,
                 allgather_id if bcast_side == "left" else left_op_id,
                 allgather_id if bcast_side == "right" else right_op_id,
                 global_barrier_3_name if bcast_side == "left" else (left_name, part_id),

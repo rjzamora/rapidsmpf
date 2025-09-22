@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     import dask_cudf
 
     from rapidsmpf.integrations.core import (
+        BCastJoinInfo,
         ShufflerIntegration,
         WorkerContext,
     )
@@ -373,8 +374,7 @@ class DaskCudfJoinIntegration:
     def join_partition(
         left_input: Callable[[int], cudf.DataFrame],
         right_input: Callable[[int], cudf.DataFrame],
-        bcast_side: Literal["left", "right", "none"],
-        bcast_count: int,
+        bcast_info: BCastJoinInfo,
         options: Any,
     ) -> cudf.DataFrame:
         """
@@ -392,10 +392,8 @@ class DaskCudfJoinIntegration:
             chunks of a broadcasted right partition.
             The bcast_count argument corresponds to the number
             of chunks the callable can produce.
-        bcast_side
-            The side of the join being broadcasted (if either).
-        bcast_count
-            The number of broadcasted chunks.
+        bcast_info
+            The broadcast join information.
         options
             Additional join options.
 
@@ -407,24 +405,19 @@ class DaskCudfJoinIntegration:
         -----
         This method is used to produce a single joined table chunk.
         """
-        if bcast_side not in ("left", "right", "none"):  # pragma: no cover
-            raise ValueError(
-                f"Expected one of 'left', 'right', or 'none'. Got {bcast_side}"
-            )
-
         join_kwargs = {
             "left_on": options["left_on"],
             "right_on": options["right_on"],
             "how": options["how"],
         }
 
-        if bcast_side == "none" or bcast_count < 2:
+        if bcast_info.bcast_side == "none" or bcast_info.bcast_count < 2:
             return left_input(0).merge(right_input(0), **join_kwargs)
         else:
             return cudf.concat(
                 [
                     left_input(i).merge(right_input(i), **join_kwargs)
-                    for i in range(bcast_count)
+                    for i in range(bcast_info.bcast_count)
                 ]
             )
 
