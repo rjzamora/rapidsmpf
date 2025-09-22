@@ -9,7 +9,7 @@ import weakref
 from dataclasses import dataclass, field
 from functools import partial
 from numbers import Number  # noqa: TC003
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, Literal, Protocol, TypeVar
 
 import rmm.mr
 from rmm.pylibrmm.stream import DEFAULT_STREAM
@@ -528,8 +528,8 @@ class JoinIntegration(Protocol[DataFrameT]):
 
     @staticmethod
     def join_partition(
-        left_input: GetPartition,
-        right_input: GetPartition,
+        left_input: FetchPartition,
+        right_input: FetchPartition,
         bcast_info: BCastJoinInfo,
         options: Any,
     ) -> DataFrameT:
@@ -622,86 +622,78 @@ def stage_partitions(
             ctx.staged_data_access_counts[allgather_id] = 0
 
 
-class GetPartition(Protocol):
-    """Base class for getting a partition for a join."""
+class FetchPartition(Generic[DataFrameT]):
+    """
+    Fetch a left or right partition for a join operation.
 
-    def __call__(self, partition_id: int) -> Any:  # pragma: no cover
-        """Return the partition associated with the given id."""
-        raise NotImplementedError("Return the partition associated with the given id.")
-
-
-class GetBroadcastedPartition(GetPartition):
-    """Get a broadcasted partition for a join."""
-
-    def __init__(
-        self,
-        get_worker_context: Callable[..., WorkerContext],
-        allgather_id: int,
-        broadcast_count: int,
-        worker_task_count: int,
-    ):
-        self.get_worker_context = get_worker_context
-        self.allgather_id = allgather_id
-        self.broadcast_count = broadcast_count
-        self.access_count_limit = broadcast_count * worker_task_count
-
-    def __call__(self, partition_id: int) -> Any:
-        """Return the partition associated with the given id."""
-        if partition_id >= self.broadcast_count:
-            raise ValueError(
-                f"Partition id {partition_id} is out of bounds. Expected < {self.broadcast_count}."
-            )
-
-        allgather_id = self.allgather_id
-        access_count_limit = self.access_count_limit
-        get_worker_context = self.get_worker_context
-        ctx = get_worker_context()
-        with ctx.lock:
-            if allgather_id not in ctx.staged_data:
-                raise ValueError(
-                    f"Allgather id {allgather_id} not found in staged data."
-                )
-            ctx.staged_data_access_counts[allgather_id] += 1
-            try:
-                return ctx.staged_data[allgather_id][partition_id]
-            finally:
-                # Cleanup
-                if (
-                    access_count_limit
-                    and ctx.staged_data_access_counts[allgather_id]
-                    >= access_count_limit
-                ):
-                    assert ctx.shufflers[allgather_id].finished(), (
-                        f"Allgather {allgather_id} is not finished."
-                    )
-                    del ctx.shufflers[allgather_id]
-                    del ctx.staged_data[allgather_id]
-                    del ctx.staged_data_access_counts[allgather_id]
-
-
-class GetOtherPartition(GetPartition):
-    """Get a non-broadcasted partition for a join."""
+    Parameters
+    ----------
+    side
+        The side of the join being fetched.
+    output_partition_id
+        The output partition id.
+    get_context
+        Callable function to fetch the worker context.
+    integration
+        The JoinIntegration protocol to use.
+    op_id
+        The operation id.
+    barrier
+        The barrier to fetch the partition from.
+    bcast_info
+        The broadcast join information.
+    n_worker_tasks
+        The number of join_partition tasks to be called on this worker.
+    options
+        Additional options.
+    """
 
     def __init__(
         self,
-        partition_id: int,
+        side: Literal["left", "right"],
+        output_partition_id: int,
         get_worker_context: Callable[..., WorkerContext],
         integration: JoinIntegration[DataFrameT],
         op_id: int | None,
-        barrier: DataFrameT | Any,
+        barrier: DataFrameT | tuple[int, ...],
+        bcast_info: BCastJoinInfo,
+        n_worker_tasks: int,
         options: Any,
-        broadcast_count: int,
-        *,
-        need_local_repartition: bool = False,
     ):
+        self.side = side
+        self.get_worker_context = get_worker_context
+        self.integration = integration
+        self.op_id = op_id
+        self.bcast_info = bcast_info
+        self.n_worker_tasks = n_worker_tasks
+        self.options = options
+        self._unbroadcasted_data: dict[int, DataFrameT] = {}
+        if self.side != self.bcast_info.bcast_side:
+            self._prepare_unbroadcasted_data(output_partition_id, barrier)
+
+    def _prepare_unbroadcasted_data(
+        self, output_partition_id: int, barrier: DataFrameT | tuple[int, ...]
+    ) -> None:
+        """
+        Prepare the unbroadcasted data.
+
+        Notes
+        -----
+        If the partition was not broadcasted, we can extract it now.
+        """
+        op_id = self.op_id
+        bcast_info = self.bcast_info
+        options = self.options
+        data: DataFrameT
         if op_id is None:
+            assert not isinstance(barrier, tuple), "Barrier must be a DataFrame."
             data = barrier
         else:
-            ctx = get_worker_context()
+            ctx = self.get_worker_context()
             shuffler = get_shuffler(ctx, op_id)
             try:
-                data = integration.get_shuffler_integration().extract_partition(
-                    partition_id,
+                data = self.integration.get_shuffler_integration().extract_partition(
+                    output_partition_id,
                     shuffler,
                     options,
                 )
@@ -711,19 +703,68 @@ class GetOtherPartition(GetPartition):
                         if op_id in ctx.shufflers:
                             del ctx.shufflers[op_id]
 
-        if broadcast_count > 1 and need_local_repartition:
-            self.data = integration.local_repartition(data, broadcast_count, options)
+        if bcast_info.bcast_count > 1 and bcast_info.need_local_repartition:
+            self._unbroadcasted_data = self.integration.local_repartition(
+                data, bcast_info.bcast_count, options
+            )
         else:
-            self.data = {0: data}
-        self.broadcast_count = broadcast_count
-        self.need_local_repartition = need_local_repartition
+            self._unbroadcasted_data = {0: data}
 
     def __call__(self, partition_id: int) -> Any:
-        """Return the partition associated with the given id."""
-        if self.broadcast_count > 1 and self.need_local_repartition:
-            return self.data[partition_id]
+        """
+        Return the partition associated with the given id.
+
+        Parameters
+        ----------
+        partition_id
+            The local partition id to fetch.
+
+        Returns
+        -------
+        The partition.
+        """
+        if self.side == self.bcast_info.bcast_side:
+            # Fetch a broadcasted partition
+            if partition_id >= self.bcast_info.bcast_count:
+                raise ValueError(
+                    f"Partition id {partition_id} is out of bounds. Expected < {self.bcast_info.bcast_count}."
+                )
+
+            allgather_id = self.op_id
+            access_count_limit = self.bcast_info.bcast_count * self.n_worker_tasks
+            ctx = self.get_worker_context()
+            with ctx.lock:
+                if allgather_id not in ctx.staged_data:
+                    raise ValueError(
+                        f"Allgather id {allgather_id} not found in staged data."
+                    )
+                ctx.staged_data_access_counts[allgather_id] += 1
+                try:
+                    return ctx.staged_data[allgather_id][partition_id]
+                finally:
+                    # Cleanup
+                    if (
+                        access_count_limit
+                        and ctx.staged_data_access_counts[allgather_id]
+                        >= access_count_limit
+                    ):
+                        assert ctx.shufflers[allgather_id].finished(), (
+                            f"Allgather {allgather_id} is not finished."
+                        )
+                        del ctx.shufflers[allgather_id]
+                        del ctx.staged_data[allgather_id]
+                        del ctx.staged_data_access_counts[allgather_id]
+
+        elif self.bcast_info.bcast_count > 1 and self.bcast_info.need_local_repartition:
+            # Fetch a locally-repartitioned non-broadcasted partition.
+            # We used the partition_id, because the single non-broadcasted
+            # data has been locally repartitioned into multiple chunks.
+            return self._unbroadcasted_data[partition_id]
+
         else:
-            return self.data[0]
+            # Fetch a non-broadcasted partition.
+            # The partition_id is ignored, because we only have a single chunk.
+            return self._unbroadcasted_data[0]
 
 
 def join_partition(
@@ -787,7 +828,7 @@ def join_partition(
     A joined DataFrame partition.
     """
 
-    def _get_input(side: Literal["left", "right"]) -> GetPartition:
+    def _get_input(side: Literal["left", "right"]) -> FetchPartition:
         """Return the input for one side of the join."""
         if side == "left":
             op_id = left_op_id
@@ -800,27 +841,17 @@ def join_partition(
         else:
             raise ValueError(f"Invalid side: {side}")
 
-        if side == bcast_info.bcast_side:
-            assert op_id is not None, (
-                "Operation id is required for broadcasted partitions."
-            )
-            return GetBroadcastedPartition(
-                get_context,
-                op_id,
-                bcast_info.bcast_count,
-                n_worker_tasks,
-            )
-        else:
-            return GetOtherPartition(
-                part_id,
-                get_context,
-                integration,
-                op_id,
-                barrier,
-                options,
-                bcast_info.bcast_count,
-                need_local_repartition=bcast_info.need_local_repartition,
-            )
+        return FetchPartition(
+            side,
+            part_id,
+            get_context,
+            integration,
+            op_id,
+            barrier,
+            bcast_info,
+            n_worker_tasks,
+            options,
+        )
 
     return integration.join_partition(
         _get_input("left"),
