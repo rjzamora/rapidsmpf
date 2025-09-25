@@ -9,7 +9,16 @@ import weakref
 from dataclasses import dataclass, field
 from functools import cached_property, partial
 from numbers import Number  # noqa: TC003
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, Literal, Protocol, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Generic,
+    Literal,
+    Protocol,
+    TypeVar,
+    cast,
+)
 
 import rmm.mr
 from rmm.pylibrmm.stream import DEFAULT_STREAM
@@ -85,6 +94,44 @@ def get_new_shuffle_id(get_occupied_ids: Callable[[], Sequence[set[int]]]) -> in
         return _shuffle_id_vacancy.pop()
 
 
+class StagedBcastData(Generic[DataFrameT]):
+    """
+    Staged broadcast data.
+
+    Parameters
+    ----------
+    chunks
+        The list of staged DataFrame chunks.
+    """
+
+    __slots__ = ("access_counts", "chunks")
+
+    def __init__(self, chunks: list[DataFrameT]):
+        self.chunks: list[DataFrameT] = chunks
+        # We keep track of the number of times the chunks
+        # have been accessed via the `get_chunk` method.
+        # This is used to clean up the staged data after
+        # a broadcast join is finished.
+        self.access_counts: int = 0
+
+    def get_chunk(self, chunk_id: int) -> DataFrameT:
+        """
+        Get a staged DataFrame chunk.
+
+        Parameters
+        ----------
+        chunk_id
+            The index of the chunk to return.
+
+        Returns
+        -------
+        A DataFrame chunk.
+        """
+        self.access_counts += 1
+        chunk: DataFrameT = self.chunks[chunk_id]
+        return chunk
+
+
 @dataclass
 class WorkerContext:
     """
@@ -107,13 +154,9 @@ class WorkerContext:
         A collection of Python objects that can be spilled to free up device memory.
     shufflers
         A mapping from shuffler IDs to active shuffler or allgather instances.
-    staged_data
+    staged_bcast_data
         A mapping from allgather IDs to staged data.
         This attribute is used to stage data that has been broadcasted to the worker.
-    staged_data_access_counts
-        A mapping from allgather IDs to the number of times the staged data has
-        been accessed.
-        This attribute is used to clean up staged data after a broadcast join.
     options
         Configuration options.
     """
@@ -124,10 +167,9 @@ class WorkerContext:
     comm: Communicator
     statistics: Statistics
     spill_collection: SpillCollection = field(default_factory=SpillCollection)
-    # TODO: `shufflers` should be renamed (it also includes allgathers)
+    # TODO: Rename `shufflers`?
     shufflers: dict[int, Shuffler | AllGather] = field(default_factory=dict)
-    staged_data: dict[int, list[Any]] = field(default_factory=dict)
-    staged_data_access_counts: dict[int, int] = field(default_factory=dict)
+    staged_bcast_data: dict[int, StagedBcastData[Any]] = field(default_factory=dict)
     options: Options = field(default_factory=Options)
 
     def get_statistics(self) -> dict[str, dict[str, Number]]:
@@ -613,16 +655,18 @@ def stage_partitions(
     with ctx.lock:
         allgather = get_allgather(ctx, allgather_id)
         ordered = options.get("ordered", True)
-        ctx.staged_data[allgather_id] = [
-            integration.unpack_partition(ctx, data, options)
-            for data in allgather.wait_and_extract(ordered=ordered)
-        ]
-        for data in ctx.staged_data[allgather_id]:
+        ctx.staged_bcast_data[allgather_id] = cast(
+            "StagedBcastData[Any]",
+            StagedBcastData(
+                chunks=[
+                    integration.unpack_partition(ctx, data, options)
+                    for data in allgather.wait_and_extract(ordered=ordered)
+                ]
+            ),
+        )
+        for chunk in ctx.staged_bcast_data[allgather_id].chunks:
             # Make sure the staged data is spillable
-            ctx.spill_collection.add_spillable(data)
-        if allgather_id not in ctx.staged_data_access_counts:
-            # Set the access counter to 0
-            ctx.staged_data_access_counts[allgather_id] = 0
+            ctx.spill_collection.add_spillable(chunk)
 
 
 class FetchJoinChunk(Generic[DataFrameT]):
@@ -725,26 +769,26 @@ class FetchJoinChunk(Generic[DataFrameT]):
         access_count_limit = self.bcast_info.bcast_count * self.n_worker_tasks
         ctx = self.get_worker_context()
         with ctx.lock:
-            if allgather_id not in ctx.staged_data:
+            if allgather_id not in ctx.staged_bcast_data:
                 raise ValueError(
                     f"Allgather id {allgather_id} not found in staged data."
                 )
-            ctx.staged_data_access_counts[allgather_id] += 1
             try:
-                return ctx.staged_data[allgather_id][chunk_id]  # type: ignore
+                return cast(
+                    "DataFrameT",
+                    ctx.staged_bcast_data[allgather_id].get_chunk(chunk_id),
+                )
             finally:
                 # Cleanup
                 if (
-                    access_count_limit
-                    and ctx.staged_data_access_counts[allgather_id]
+                    ctx.staged_bcast_data[allgather_id].access_counts
                     >= access_count_limit
                 ):
                     assert ctx.shufflers[allgather_id].finished(), (
                         f"Allgather {allgather_id} is not finished."
                     )
                     del ctx.shufflers[allgather_id]
-                    del ctx.staged_data[allgather_id]
-                    del ctx.staged_data_access_counts[allgather_id]
+                    del ctx.staged_bcast_data[allgather_id]
 
     def __call__(self, chunk_id: int) -> Any:
         """

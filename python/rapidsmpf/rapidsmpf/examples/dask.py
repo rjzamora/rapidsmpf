@@ -410,7 +410,7 @@ class DaskCudfJoinIntegration:
             "how": options["how"],
         }
 
-        if bcast_info is None or bcast_info.bcast_count < 2:
+        if bcast_info is None or bcast_info.bcast_count == 1:
             return left_input(0).merge(right_input(0), **join_kwargs)
         else:
             return cudf.concat(
