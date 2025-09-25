@@ -25,6 +25,7 @@ from rapidsmpf.integrations.cudf.partition import (
     unpack_and_concat,
     unspill_partitions,
 )
+from rapidsmpf.integrations.dask.spilling import SpillableWrapper
 from rapidsmpf.testing import pylibcudf_to_cudf_dataframe
 from rapidsmpf.utils.cudf import cudf_to_pylibcudf_table
 
@@ -306,7 +307,7 @@ class DaskCudfJoinIntegration:
     @staticmethod
     def unpack_partition(
         ctx: WorkerContext, data: PackedData, options: Any
-    ) -> cudf.DataFrame:
+    ) -> SpillableWrapper:
         """Unpack a finished partition from the RMPF shuffler."""
         column_names = options["column_names"]
         plc_table = unpack_and_concat(
@@ -319,7 +320,9 @@ class DaskCudfJoinIntegration:
             br=ctx.br,
             stream=DEFAULT_STREAM,
         )
-        return pylibcudf_to_cudf_dataframe(plc_table, column_names=column_names)
+        return SpillableWrapper(
+            on_device=pylibcudf_to_cudf_dataframe(plc_table, column_names=column_names)
+        )
 
     @staticmethod
     def local_repartition(

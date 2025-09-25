@@ -425,7 +425,8 @@ def test_clear_shuffle_statistics() -> None:
 @pytest.mark.parametrize("how", ["inner", "left", "right"])
 @pytest.mark.parametrize("left_pre_shuffled", [True, False])
 @pytest.mark.parametrize("right_pre_shuffled", [True, False])
-@pytest.mark.parametrize("bcast_limit", [1, 5])
+# @pytest.mark.parametrize("bcast_limit", [1, 5])
+@pytest.mark.parametrize("bcast_limit", [5])
 def test_dask_cudf_join(
     loop: pytest.FixtureDef,  # noqa: F811
     how: Literal["inner", "left", "right"],

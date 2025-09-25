@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
     from rapidsmpf.buffer.packed_data import PackedData
+    from rapidsmpf.buffer.spill_collection import Spillable
     from rapidsmpf.communicator.communicator import Communicator
 
 
@@ -94,29 +95,29 @@ def get_new_shuffle_id(get_occupied_ids: Callable[[], Sequence[set[int]]]) -> in
         return _shuffle_id_vacancy.pop()
 
 
-class StagedBcastData(Generic[DataFrameT]):
+class StagedBcastData:
     """
     Staged broadcast data.
 
     Parameters
     ----------
     chunks
-        The list of staged DataFrame chunks.
+        The list of staged Spillable chunks.
     """
 
     __slots__ = ("access_counts", "chunks")
 
-    def __init__(self, chunks: list[DataFrameT]):
-        self.chunks: list[DataFrameT] = chunks
+    def __init__(self, chunks: list[Spillable]):
+        self.chunks: list[Spillable] = chunks
         # We keep track of the number of times the chunks
         # have been accessed via the `get_chunk` method.
         # This is used to clean up the staged data after
         # a broadcast join is finished.
         self.access_counts: int = 0
 
-    def get_chunk(self, chunk_id: int) -> DataFrameT:
+    def get_chunk(self, chunk_id: int) -> Spillable:
         """
-        Get a staged DataFrame chunk.
+        Get a staged Spillable chunk.
 
         Parameters
         ----------
@@ -125,10 +126,10 @@ class StagedBcastData(Generic[DataFrameT]):
 
         Returns
         -------
-        A DataFrame chunk.
+        A Spillable chunk.
         """
         self.access_counts += 1
-        chunk: DataFrameT = self.chunks[chunk_id]
+        chunk: Spillable = self.chunks[chunk_id]
         return chunk
 
 
@@ -169,7 +170,7 @@ class WorkerContext:
     spill_collection: SpillCollection = field(default_factory=SpillCollection)
     # TODO: Rename `shufflers`?
     shufflers: dict[int, Shuffler | AllGather] = field(default_factory=dict)
-    staged_bcast_data: dict[int, StagedBcastData[Any]] = field(default_factory=dict)
+    staged_bcast_data: dict[int, StagedBcastData] = field(default_factory=dict)
     options: Options = field(default_factory=Options)
 
     def get_statistics(self) -> dict[str, dict[str, Number]]:
@@ -549,7 +550,7 @@ class JoinIntegration(Protocol[DataFrameT]):
     @staticmethod
     def unpack_partition(
         ctx: WorkerContext, data: PackedData, options: Any
-    ) -> DataFrameT:
+    ) -> Spillable:
         """
         Unpack a broadcasted partition.
 
@@ -564,7 +565,7 @@ class JoinIntegration(Protocol[DataFrameT]):
 
         Returns
         -------
-        A DataFrame partition.
+        A Spillable object containing the extracted partition.
         """
         ...
 
@@ -736,14 +737,11 @@ def stage_partitions(
     with ctx.lock:
         allgather = get_allgather(ctx, allgather_id)
         ordered = options.get("ordered", True)
-        ctx.staged_bcast_data[allgather_id] = cast(
-            "StagedBcastData[Any]",
-            StagedBcastData(
-                chunks=[
-                    integration.unpack_partition(ctx, data, options)
-                    for data in allgather.wait_and_extract(ordered=ordered)
-                ]
-            ),
+        ctx.staged_bcast_data[allgather_id] = StagedBcastData(
+            chunks=[
+                integration.unpack_partition(ctx, data, options)
+                for data in allgather.wait_and_extract(ordered=ordered)
+            ]
         )
         for chunk in ctx.staged_bcast_data[allgather_id].chunks:
             # Make sure the staged data is spillable
@@ -848,10 +846,10 @@ class FetchJoinChunk(Generic[DataFrameT]):
                     f"Allgather id {allgather_id} not found in staged data."
                 )
             try:
-                return cast(
-                    "DataFrameT",
-                    ctx.staged_bcast_data[allgather_id].get_chunk(chunk_id),
+                data: Spillable = ctx.staged_bcast_data[allgather_id].get_chunk(
+                    chunk_id
                 )
+                return cast("DataFrameT", data.unspill())
             finally:
                 # Cleanup
                 if (
