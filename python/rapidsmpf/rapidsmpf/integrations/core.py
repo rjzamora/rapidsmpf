@@ -7,7 +7,7 @@ from __future__ import annotations
 import threading
 import weakref
 from dataclasses import dataclass, field
-from functools import partial
+from functools import cached_property, partial
 from numbers import Number  # noqa: TC003
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, Literal, Protocol, TypeVar
 
@@ -434,17 +434,15 @@ class BCastJoinInfo:
     ----------
     bcast_side
         The side of the join being broadcasted.
-        If "none", this is a regular hash join.
     bcast_count
         The number of broadcasted partitions.
-        This is 0 for regular hash joins.
     need_local_repartition
         Whether to locally repartition on the broadcasted table.
-        This is not necessary for inner or regular hash joins.
+        This is not necessary for inner joins.
     """
 
-    bcast_side: Literal["left", "right", "none"] = "none"
-    bcast_count: int = 0
+    bcast_side: Literal["left", "right"]
+    bcast_count: int = 1
     need_local_repartition: bool = False
 
 
@@ -528,9 +526,9 @@ class JoinIntegration(Protocol[DataFrameT]):
 
     @staticmethod
     def join_partition(
-        left_input: FetchPartition,
-        right_input: FetchPartition,
-        bcast_info: BCastJoinInfo,
+        left_input: Callable[[int], DataFrameT],
+        right_input: Callable[[int], DataFrameT],
+        bcast_info: BCastJoinInfo | None,
         options: Any,
     ) -> DataFrameT:
         """
@@ -539,11 +537,16 @@ class JoinIntegration(Protocol[DataFrameT]):
         Parameters
         ----------
         left_input
-            A callable that produces the partition(s) needed for the left table.
+            A callable that produces chunks of the left partition.
+            The ``bcast_info.bcast_count`` parameter corresponds
+            to the number of chunks the callable can produce.
         right_input
-            A callable that produces the partition(s) needed for the right table.
+            A callable that produces chunks of the right partition.
+            The ``bcast_info.bcast_count`` parameter corresponds
+            to the number of chunks the callable can produce.
         bcast_info
-            The broadcast join information.
+            The broadcast join information. This should be None
+            for a regular hash join.
         options
             Additional join options.
 
@@ -622,16 +625,16 @@ def stage_partitions(
             ctx.staged_data_access_counts[allgather_id] = 0
 
 
-class FetchPartition(Generic[DataFrameT]):
+class FetchJoinChunk(Generic[DataFrameT]):
     """
-    Fetch a left or right partition for a join operation.
+    Fetch the data for one side of a join operation.
 
     Parameters
     ----------
     side
         The side of the join being fetched.
     output_partition_id
-        The output partition id.
+        The output partition id for the join operation.
     get_context
         Callable function to fetch the worker context.
     integration
@@ -646,6 +649,12 @@ class FetchPartition(Generic[DataFrameT]):
         The number of join_partition tasks to be called on this worker.
     options
         Additional options.
+
+    Notes
+    -----
+    A ``FetchJoinChunk`` object only fetches data needed for a single
+    output partition. For in-memory or shuffled data, there will only be
+    one chunk to return. For broadcast joins, there may be multiple chunks.
     """
 
     def __init__(
@@ -656,46 +665,36 @@ class FetchPartition(Generic[DataFrameT]):
         integration: JoinIntegration[DataFrameT],
         op_id: int | None,
         barrier: DataFrameT | tuple[int, ...],
-        bcast_info: BCastJoinInfo,
+        bcast_info: BCastJoinInfo | None,
         n_worker_tasks: int,
         options: Any,
     ):
         self.side = side
+        self.output_partition_id = output_partition_id
         self.get_worker_context = get_worker_context
         self.integration = integration
         self.op_id = op_id
+        self.barrier = barrier
         self.bcast_info = bcast_info
         self.n_worker_tasks = n_worker_tasks
         self.options = options
-        self._unbroadcasted_data: dict[int, DataFrameT] = {}
-        if self.side != self.bcast_info.bcast_side:
-            self._prepare_unbroadcasted_data(output_partition_id, barrier)
 
-    def _prepare_unbroadcasted_data(
-        self, output_partition_id: int, barrier: DataFrameT | tuple[int, ...]
-    ) -> None:
-        """
-        Prepare the unbroadcasted data.
-
-        Notes
-        -----
-        If the partition was not broadcasted, we can extract it now.
-        """
+    @cached_property
+    def _data(self) -> dict[int, DataFrameT]:
+        """Return a dictionary of DataFrame chunks."""
         op_id = self.op_id
-        bcast_info = self.bcast_info
-        options = self.options
         data: DataFrameT
         if op_id is None:
-            assert not isinstance(barrier, tuple), "Barrier must be a DataFrame."
-            data = barrier
+            assert not isinstance(self.barrier, tuple), "Barrier must be a DataFrame."
+            data = self.barrier
         else:
             ctx = self.get_worker_context()
             shuffler = get_shuffler(ctx, op_id)
             try:
                 data = self.integration.get_shuffler_integration().extract_partition(
-                    output_partition_id,
+                    self.output_partition_id,
                     shuffler,
-                    options,
+                    self.options,
                 )
             finally:
                 if shuffler.finished():
@@ -703,74 +702,84 @@ class FetchPartition(Generic[DataFrameT]):
                         if op_id in ctx.shufflers:
                             del ctx.shufflers[op_id]
 
-        if bcast_info.bcast_count > 1 and bcast_info.need_local_repartition:
-            self._unbroadcasted_data = self.integration.local_repartition(
-                data, bcast_info.bcast_count, options
-            )
+        if (
+            self.bcast_info is None
+            or self.bcast_info.bcast_count == 1
+            or not self.bcast_info.need_local_repartition
+        ):
+            return {0: data}
         else:
-            self._unbroadcasted_data = {0: data}
+            return self.integration.local_repartition(
+                data, self.bcast_info.bcast_count, self.options
+            )
 
-    def __call__(self, partition_id: int) -> Any:
+    def _get_bcasted_chunk(self, chunk_id: int) -> DataFrameT:
+        """Return a broadcasted DataFrame chunk."""
+        assert self.bcast_info is not None, "Broadcast join information is required."
+        if chunk_id >= self.bcast_info.bcast_count:
+            raise ValueError(
+                f"Partition id {chunk_id} is out of bounds. Expected < {self.bcast_info.bcast_count}."
+            )
+
+        allgather_id = self.op_id
+        access_count_limit = self.bcast_info.bcast_count * self.n_worker_tasks
+        ctx = self.get_worker_context()
+        with ctx.lock:
+            if allgather_id not in ctx.staged_data:
+                raise ValueError(
+                    f"Allgather id {allgather_id} not found in staged data."
+                )
+            ctx.staged_data_access_counts[allgather_id] += 1
+            try:
+                return ctx.staged_data[allgather_id][chunk_id]  # type: ignore
+            finally:
+                # Cleanup
+                if (
+                    access_count_limit
+                    and ctx.staged_data_access_counts[allgather_id]
+                    >= access_count_limit
+                ):
+                    assert ctx.shufflers[allgather_id].finished(), (
+                        f"Allgather {allgather_id} is not finished."
+                    )
+                    del ctx.shufflers[allgather_id]
+                    del ctx.staged_data[allgather_id]
+                    del ctx.staged_data_access_counts[allgather_id]
+
+    def __call__(self, chunk_id: int) -> Any:
         """
-        Return the partition associated with the given id.
+        Return the DataFrame associated with the given chunk id.
 
         Parameters
         ----------
-        partition_id
-            The local partition id to fetch.
+        chunk_id
+            The id of the local chunk to fetch for a join operation.
+            There will only be one chunk to return for a hash join.
+            There may be multiple chunks to return for a broadcast join.
 
         Returns
         -------
-        The partition.
+        A DataFrame chunk to be used in a join operation.
         """
-        if self.side == self.bcast_info.bcast_side:
-            # Fetch a broadcasted partition
-            if partition_id >= self.bcast_info.bcast_count:
-                raise ValueError(
-                    f"Partition id {partition_id} is out of bounds. Expected < {self.bcast_info.bcast_count}."
-                )
-
-            allgather_id = self.op_id
-            access_count_limit = self.bcast_info.bcast_count * self.n_worker_tasks
-            ctx = self.get_worker_context()
-            with ctx.lock:
-                if allgather_id not in ctx.staged_data:
-                    raise ValueError(
-                        f"Allgather id {allgather_id} not found in staged data."
-                    )
-                ctx.staged_data_access_counts[allgather_id] += 1
-                try:
-                    return ctx.staged_data[allgather_id][partition_id]
-                finally:
-                    # Cleanup
-                    if (
-                        access_count_limit
-                        and ctx.staged_data_access_counts[allgather_id]
-                        >= access_count_limit
-                    ):
-                        assert ctx.shufflers[allgather_id].finished(), (
-                            f"Allgather {allgather_id} is not finished."
-                        )
-                        del ctx.shufflers[allgather_id]
-                        del ctx.staged_data[allgather_id]
-                        del ctx.staged_data_access_counts[allgather_id]
-
-        elif self.bcast_info.bcast_count > 1 and self.bcast_info.need_local_repartition:
-            # Fetch a locally-repartitioned non-broadcasted partition.
-            # We used the partition_id, because the single non-broadcasted
-            # data has been locally repartitioned into multiple chunks.
-            return self._unbroadcasted_data[partition_id]
-
+        if self.bcast_info is None:
+            # Fetch a chunk/partition for a regular hash join.
+            # The chunk_id is ignored, because we only have a single chunk.
+            return self._data[0]
+        elif self.bcast_info.bcast_side == self.side:
+            # Fetch a broadcasted chunk for a broadcast join.
+            return self._get_bcasted_chunk(chunk_id)
         else:
-            # Fetch a non-broadcasted partition.
-            # The partition_id is ignored, because we only have a single chunk.
-            return self._unbroadcasted_data[0]
+            # Fetch a chunk of the un-broadcasted side of a broadcast join.
+            return self._data[
+                # Use the chunk_id if the data was locally repartitioned.
+                chunk_id if self.bcast_info.need_local_repartition else 0
+            ]
 
 
 def join_partition(
     get_context: Callable[..., WorkerContext],
     integration: JoinIntegration[DataFrameT],
-    bcast_info: BCastJoinInfo,
+    bcast_info: BCastJoinInfo | None,
     left_op_id: int | None,
     right_op_id: int | None,
     left_dependency: DataFrameT | tuple[int, ...],
@@ -792,6 +801,7 @@ def join_partition(
         The JoinIntegration protocol to use.
     bcast_info
         The broadcast join information.
+        This should be None for a regular hash join.
     left_op_id
         The left-table operation id. The operation may correspond
         to an allgather or a shuffle operation. If None, the
@@ -828,7 +838,7 @@ def join_partition(
     A joined DataFrame partition.
     """
 
-    def _get_input(side: Literal["left", "right"]) -> FetchPartition:
+    def _get_input(side: Literal["left", "right"]) -> FetchJoinChunk:
         """Return the input for one side of the join."""
         if side == "left":
             op_id = left_op_id
@@ -841,7 +851,7 @@ def join_partition(
         else:
             raise ValueError(f"Invalid side: {side}")
 
-        return FetchPartition(
+        return FetchJoinChunk(
             side,
             part_id,
             get_context,

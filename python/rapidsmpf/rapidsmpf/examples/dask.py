@@ -374,7 +374,7 @@ class DaskCudfJoinIntegration:
     def join_partition(
         left_input: Callable[[int], cudf.DataFrame],
         right_input: Callable[[int], cudf.DataFrame],
-        bcast_info: BCastJoinInfo,
+        bcast_info: BCastJoinInfo | None,
         options: Any,
     ) -> cudf.DataFrame:
         """
@@ -383,17 +383,16 @@ class DaskCudfJoinIntegration:
         Parameters
         ----------
         left_input
-            The left partition or a callable that produces
-            chunks of a broadcasted left partition.
-            The bcast_count argument corresponds to the number
-            of chunks the callable can produce.
+            A callable that produces chunks of the left partition.
+            The ``bcast_info.bcast_count`` parameter corresponds
+            to the number of chunks the callable can produce.
         right_input
-            The right partition or a callable that produces
-            chunks of a broadcasted right partition.
-            The bcast_count argument corresponds to the number
-            of chunks the callable can produce.
+            A callable that produces chunks of the right partition.
+            The ``bcast_info.bcast_count`` parameter corresponds
+            to the number of chunks the callable can produce.
         bcast_info
             The broadcast join information.
+            This should be None for a regular hash join.
         options
             Additional join options.
 
@@ -411,7 +410,7 @@ class DaskCudfJoinIntegration:
             "how": options["how"],
         }
 
-        if bcast_info.bcast_side == "none" or bcast_info.bcast_count < 2:
+        if bcast_info is None or bcast_info.bcast_count < 2:
             return left_input(0).merge(right_input(0), **join_kwargs)
         else:
             return cudf.concat(
@@ -488,7 +487,7 @@ def dask_cudf_join(
     right_partition_count_in = right0.npartitions
 
     # Define bcast_side and shuffle the broadcasted table (if necessary)
-    bcast_side: Literal["left", "right", "none"] = "none"
+    bcast_side: Literal["left", "right", None] = None
     need_local_repartition = False
     npartitions_out = max(left_partition_count_in, right_partition_count_in)
     if (
@@ -518,14 +517,19 @@ def dask_cudf_join(
         left_partition_count_in,
         right_partition_count_in,
         DaskCudfJoinIntegration(),
+        # Options that may be used for shuffling, broadcasting,
+        # or repartitioning the left side.
         {
             "column_names": left0.columns,
             "on": left_on,
         },
+        # Options that may be used for shuffling, broadcasting,
+        # or repartitioning the right side.
         {
             "column_names": right0.columns,
             "on": right_on,
         },
+        # Options that may be used for joining.
         {
             "left_on": left_on,
             "right_on": right_on,

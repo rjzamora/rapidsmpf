@@ -26,7 +26,7 @@ from rapidsmpf.integrations.dask.core import (
 )
 from rapidsmpf.integrations.dask.shuffler import (
     _get_occupied_ids_dask,
-    _partial_shuffle_graph,
+    _shuffle_insertion_graph,
     rapidsmpf_shuffle_graph,
 )
 
@@ -94,7 +94,7 @@ def rapidsmpf_join_graph(
     right_options: Any,
     join_options: Any,
     *,
-    bcast_side: Literal["left", "right", "none"] = "none",
+    bcast_side: Literal["left", "right", None] = None,
     need_local_repartition: bool = False,
     left_pre_shuffled: bool = False,
     right_pre_shuffled: bool = False,
@@ -125,8 +125,8 @@ def rapidsmpf_join_graph(
         Additional options for the join.
     bcast_side
         The side of the join being broadcasted.
-        Options are ``{'left', 'right', 'none'}``.
-        Note: Only ``'none'`` is supported for now.
+        Options are ``{'left', 'right', None}``.
+        Note: Only ``None`` is supported for now.
     need_local_repartition
         Whether the join needs local repartitioning.
         The small-table will be shuffled (if it was not
@@ -163,16 +163,20 @@ def rapidsmpf_join_graph(
     # Determine the number of partitions in the output table
     partition_count_out = max(left_partition_count_in, right_partition_count_in)
 
-    if bcast_side == "none":
+    if bcast_side is None:
         # Regular hash join
 
         # Shuffle left side (if necessary)
         if not left_pre_shuffled or left_partition_count_in != partition_count_out:
-            left_barrier_name = f"rmpf-shuffle-left-{output_name}"
-            left_op_id, left_restricted_keys, left_graph = _partial_shuffle_graph(
+            (
+                left_graph,
+                left_barrier_name,
+                left_restricted_keys,
+                left_op_id,
+            ) = _shuffle_insertion_graph(
                 client,
                 left_name,
-                left_barrier_name,
+                f"left-{output_name}",
                 left_partition_count_in,
                 partition_count_out,
                 integration.get_shuffler_integration(),
@@ -184,11 +188,15 @@ def rapidsmpf_join_graph(
 
         # Shuffle right side (if necessary)
         if not right_pre_shuffled or right_partition_count_in != partition_count_out:
-            right_barrier_name = f"rmpf-shuffle-right-{output_name}"
-            right_op_id, right_restricted_keys, right_graph = _partial_shuffle_graph(
+            (
+                right_graph,
+                right_barrier_name,
+                right_restricted_keys,
+                right_op_id,
+            ) = _shuffle_insertion_graph(
                 client,
                 right_name,
-                right_barrier_name,
+                f"right-{output_name}",
                 right_partition_count_in,
                 partition_count_out,
                 integration.get_shuffler_integration(),
@@ -199,7 +207,6 @@ def rapidsmpf_join_graph(
             graph.update(right_graph)
 
         # Add basic hash-join tasks
-        bcast_info = BCastJoinInfo()  # Not a broadcast join
         for part_id in range(partition_count_out):
             rank = part_id % n_workers
             n_worker_tasks = partition_count_out // n_workers + int(
@@ -210,7 +217,7 @@ def rapidsmpf_join_graph(
                 join_partition,
                 get_worker_context,
                 integration,
-                bcast_info,
+                None,  # Not a broadcast join
                 left_op_id,
                 right_op_id,
                 left_barrier_name or (left_name, part_id),
@@ -224,13 +231,13 @@ def rapidsmpf_join_graph(
             # Assume round-robin partition assignment
             restricted_keys[key] = worker_ranks[rank]
 
-    elif bcast_side in ["left", "right"]:  # pragma: no cover
+    elif bcast_side in ["left", "right"]:
         # Pre-shuffle small table (if necessary)
         if need_local_repartition and (
             (bcast_side == "right" and not right_pre_shuffled)
             or (bcast_side == "left" and not left_pre_shuffled)
         ):
-            # TODO: Use _partial_shuffle_graph instead (if practical)
+            # TODO: Use _shuffle_insertion_graph instead (if practical)
             new_name = f"rmpf-shuffle-small-{output_name}"
             if bcast_side == "right":
                 input_name = right_name
