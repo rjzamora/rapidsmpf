@@ -575,22 +575,22 @@ class JoinIntegration(Protocol[DataFrameT]):
         options: Any,
     ) -> dict[int, DataFrameT]:
         """
-        Break a single DataFrame partition into multiple local partitions.
+        Break a single DataFrame partition into multiple chunks.
 
         Parameters
         ----------
         data
             The local DataFrame partition.
         partition_count
-            The number of local partitions to generate.
+            The number of local chunks to generate.
         options
             Additional options.
 
         Returns
         -------
-        A dictionary of DataFrame partitions.
-        The keys are the partition ids.
-        The values are the DataFrame partitions.
+        A dictionary of DataFrame chunks.
+        The keys are the chunk ids.
+        The values are the DataFrame chunks.
         """
         ...
 
