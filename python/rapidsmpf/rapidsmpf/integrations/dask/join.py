@@ -13,6 +13,7 @@ from rapidsmpf.config import Options
 from rapidsmpf.integrations.core import (
     BCastJoinInfo,
     bcast_partition,
+    bcast_shuffled_partition,
     get_allgather,
     get_new_shuffle_id,
     join_partition,
@@ -27,7 +28,6 @@ from rapidsmpf.integrations.dask.core import (
 from rapidsmpf.integrations.dask.shuffler import (
     _get_occupied_ids_dask,
     _shuffle_insertion_graph,
-    rapidsmpf_shuffle_graph,
 )
 
 if TYPE_CHECKING:
@@ -89,7 +89,7 @@ def rapidsmpf_join_graph(
     output_name: str,
     left_partition_count_in: int,
     right_partition_count_in: int,
-    integration: JoinIntegration,
+    join_integration: JoinIntegration,
     left_options: Any,
     right_options: Any,
     join_options: Any,
@@ -115,7 +115,7 @@ def rapidsmpf_join_graph(
         The number of partitions in the left table.
     right_partition_count_in
         The number of partitions in the right table.
-    integration
+    join_integration
         The JoinIntegration protocol to use.
     left_options
         Additional options for extracting the left table.
@@ -179,7 +179,7 @@ def rapidsmpf_join_graph(
                 f"left-{output_name}",
                 left_partition_count_in,
                 partition_count_out,
-                integration.get_shuffler_integration(),
+                join_integration.get_shuffler_integration(),
                 worker_ranks,
                 left_options,
             )
@@ -199,7 +199,7 @@ def rapidsmpf_join_graph(
                 f"right-{output_name}",
                 right_partition_count_in,
                 partition_count_out,
-                integration.get_shuffler_integration(),
+                join_integration.get_shuffler_integration(),
                 worker_ranks,
                 right_options,
             )
@@ -216,7 +216,7 @@ def rapidsmpf_join_graph(
             graph[key] = (
                 join_partition,
                 get_worker_context,
-                integration,
+                join_integration,
                 None,  # Not a broadcast join
                 left_op_id,
                 right_op_id,
@@ -232,35 +232,6 @@ def rapidsmpf_join_graph(
             restricted_keys[key] = worker_ranks[rank]
 
     elif bcast_side in ["left", "right"]:
-        # Pre-shuffle small table (if necessary)
-        if need_local_repartition and (
-            (bcast_side == "right" and not right_pre_shuffled)
-            or (bcast_side == "left" and not left_pre_shuffled)
-        ):
-            # TODO: Use _shuffle_insertion_graph instead (if practical)
-            new_name = f"rmpf-shuffle-small-{output_name}"
-            if bcast_side == "right":
-                input_name = right_name
-                right_name = new_name
-                partition_count_in = right_partition_count_in
-                options = right_options
-            else:
-                input_name = left_name
-                left_name = new_name
-                partition_count_in = left_partition_count_in
-                options = left_options
-
-            small_shuffle_graph = rapidsmpf_shuffle_graph(
-                input_name,
-                new_name,
-                partition_count_in,
-                partition_count_in,
-                integration.get_shuffler_integration(),
-                options,
-                config_options=config_options,
-            )
-            graph.update(small_shuffle_graph)
-
         # Get the operation id and stage the allgather operation
         allgather_id = get_new_shuffle_id(partial(_get_occupied_ids_dask, client))
         client.run(_stage_allgather, allgather_id)
@@ -283,17 +254,59 @@ def rapidsmpf_join_graph(
 
         # Add tasks to broadcast each small-table partition
         insertion_keys: list[tuple[str, int]] = []
-        for pid in range(small_count):
-            key = (insert_name, pid)
-            graph[key] = (
-                bcast_partition,
-                get_worker_context,
-                integration,
-                (small_name, pid),
-                allgather_id,
+        if need_local_repartition and (
+            (bcast_side == "right" and not right_pre_shuffled)
+            or (bcast_side == "left" and not left_pre_shuffled)
+        ):
+            # Case #1: Pre-shuffle AND broadcast the small-table partitions
+            (
+                small_shuffle_graph,
+                small_shuffle_barrier_name,
+                small_shuffle_restricted_keys,
+                small_shuffle_id,
+            ) = _shuffle_insertion_graph(
+                client,
+                small_name,
+                f"small-{output_name}",
+                small_count,
+                small_count,
+                join_integration.get_shuffler_integration(),
+                worker_ranks,
                 bcast_options,
             )
-            insertion_keys.append(key)
+            restricted_keys.update(small_shuffle_restricted_keys)
+            graph.update(small_shuffle_graph)
+            for pid in range(small_count):
+                rank = pid % n_workers
+                key = (insert_name, pid)
+                graph[key] = (
+                    bcast_shuffled_partition,
+                    get_worker_context,
+                    join_integration,
+                    small_shuffle_id,
+                    pid,
+                    allgather_id,
+                    bcast_options,
+                    small_shuffle_barrier_name,
+                )
+                insertion_keys.append(key)
+                # NOTE: We need to resttrict the keys to
+                # specific workers to ensure we can extract
+                # the correct partition for each index.
+                restricted_keys[key] = worker_ranks[rank]
+        else:
+            # Case #2: Only broadcast the small-table partitions
+            for pid in range(small_count):
+                key = (insert_name, pid)
+                graph[key] = (
+                    bcast_partition,
+                    get_worker_context,
+                    join_integration,
+                    (small_name, pid),
+                    allgather_id,
+                    bcast_options,
+                )
+                insertion_keys.append(key)
 
         # Add global barrier task
         graph[global_barrier_1_name] = (
@@ -326,7 +339,7 @@ def rapidsmpf_join_graph(
             graph[key] = (
                 stage_partitions,
                 get_worker_context,
-                integration,
+                join_integration,
                 allgather_id,
                 bcast_options,
                 global_barrier_2_name,
@@ -355,7 +368,7 @@ def rapidsmpf_join_graph(
             graph[key] = (
                 join_partition,
                 get_worker_context,
-                integration,
+                join_integration,
                 bcast_info,
                 allgather_id if bcast_side == "left" else left_op_id,
                 allgather_id if bcast_side == "right" else right_op_id,

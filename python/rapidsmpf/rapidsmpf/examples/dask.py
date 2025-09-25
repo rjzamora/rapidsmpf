@@ -286,7 +286,7 @@ def dask_cudf_shuffle(
 
 
 class DaskCudfJoinIntegration:
-    """Dask-cuDF protocol for unified join integration."""
+    """Dask-cuDF protocol for fused join integration."""
 
     @staticmethod
     def get_shuffler_integration() -> ShufflerIntegration[cudf.DataFrame]:
@@ -509,7 +509,7 @@ def dask_cudf_join(
     token = tokenize(left0, right0, left_on, bcast_side, right_on, how)
     left_name_in = left0._name
     right_name_in = right0._name
-    name_out = f"unified-join-{token}"
+    name_out = f"fused-join-{token}"
     graph = rapidsmpf_join_graph(
         left_name_in,
         right_name_in,

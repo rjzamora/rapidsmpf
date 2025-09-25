@@ -314,6 +314,45 @@ def get_shuffler(
         return shuffler
 
 
+def _extract_shuffled_partition(
+    get_worker_context: Callable[..., WorkerContext],
+    shuffler_id: int,
+    partition_id: int,
+    shuffler_integration: ShufflerIntegration[DataFrameT],
+    options: Any,
+) -> DataFrameT:
+    """
+    Extract a shuffled partition from a Shuffler.
+
+    Parameters
+    ----------
+    get_worker_context
+        Callable function to fetch the worker context.
+    shuffler_id
+        The id of the Shuffler to extract from.
+    partition_id
+        The id of the partition to extract.
+    shuffler_integration
+        The ShufflerIntegration protocol to use.
+    options
+        Additional options.
+
+    Returns
+    -------
+    A shuffled DataFrame partition.
+    """
+    ctx: WorkerContext = get_worker_context()
+    shuffler = get_shuffler(ctx, shuffler_id)
+
+    try:
+        return shuffler_integration.extract_partition(partition_id, shuffler, options)
+    finally:
+        if shuffler.finished():
+            with ctx.lock:
+                if shuffler_id in ctx.shufflers:
+                    del ctx.shufflers[shuffler_id]
+
+
 def get_allgather(
     ctx: WorkerContext,
     allgather_id: int,
@@ -363,7 +402,7 @@ def get_allgather(
 
 
 def insert_partition(
-    get_context: Callable[..., WorkerContext],
+    get_worker_context: Callable[..., WorkerContext],
     callback: Callable[
         [
             DataFrameT,
@@ -387,7 +426,7 @@ def insert_partition(
 
     Parameters
     ----------
-    get_context
+    get_worker_context
         Callable function to fetch the worker context.
     callback
         Insertion callback function. This function must be the
@@ -410,18 +449,15 @@ def insert_partition(
         df,
         partition_id,
         partition_count,
-        get_shuffler(get_context(), shuffle_id),
+        get_shuffler(get_worker_context(), shuffle_id),
         options,
         *other_keys,
     )
 
 
 def extract_partition(
-    get_context: Callable[..., WorkerContext],
-    callback: Callable[
-        [int, Shuffler, Any],
-        DataFrameT,
-    ],
+    get_worker_context: Callable[..., WorkerContext],
+    shuffler_integration: ShufflerIntegration[DataFrameT],
     shuffle_id: int,
     partition_id: int,
     worker_barrier: tuple[int, ...],
@@ -432,12 +468,10 @@ def extract_partition(
 
     Parameters
     ----------
-    get_context
+    get_worker_context
         Callable function to fetch the worker context.
-    callback
-        Insertion callback function. This function must be the
-        `extract_partition` attribute of a `ShufflerIntegration`
-        protocol.
+    shuffler_integration
+        The ShufflerIntegration protocol to use.
     shuffle_id
         The RapidsMPF shuffle id.
     partition_id
@@ -452,19 +486,13 @@ def extract_partition(
     -------
     Extracted DataFrame partition.
     """
-    shuffler = get_shuffler(get_context(), shuffle_id)
-    try:
-        return callback(
-            partition_id,
-            shuffler,
-            options,
-        )
-    finally:
-        if shuffler.finished():
-            ctx = get_context()
-            with ctx.lock:
-                if shuffle_id in ctx.shufflers:
-                    del ctx.shufflers[shuffle_id]
+    return _extract_shuffled_partition(
+        get_worker_context,
+        shuffle_id,
+        partition_id,
+        shuffler_integration,
+        options,
+    )
 
 
 @dataclass
@@ -601,7 +629,7 @@ class JoinIntegration(Protocol[DataFrameT]):
 
 def bcast_partition(
     get_worker_context: Callable[..., WorkerContext],
-    integration: JoinIntegration[DataFrameT],
+    join_integration: JoinIntegration[DataFrameT],
     partition: DataFrameT,
     allgather_id: int,
     options: Any,
@@ -613,7 +641,7 @@ def bcast_partition(
     ----------
     get_worker_context
         Callable function to fetch the worker context.
-    integration
+    join_integration
         The JoinIntegration protocol to use.
     partition
         The partition to broadcast.
@@ -625,7 +653,60 @@ def bcast_partition(
     ctx = get_worker_context()
     with ctx.lock:
         allgather = get_allgather(ctx, allgather_id)
-        allgather.insert(integration.pack_partition(ctx, partition, options))
+        allgather.insert(join_integration.pack_partition(ctx, partition, options))
+
+
+def bcast_shuffled_partition(
+    get_worker_context: Callable[..., WorkerContext],
+    join_integration: JoinIntegration[DataFrameT],
+    shuffler_id: int,
+    partition_id: int,
+    allgather_id: int,
+    options: Any,
+    barrier: Any,
+) -> None:
+    """
+    Broadcast a shuffled partition to all workers.
+
+    Parameters
+    ----------
+    get_worker_context
+        Callable function to fetch the worker context.
+    join_integration
+        The JoinIntegration protocol to use.
+    shuffler_id
+        The id of the Shuffler providing the input partition.
+    partition_id
+        The input partition id.
+    allgather_id
+        The allgather id.
+    options
+        Additional options.
+    barrier
+        The global shuffle barrier.
+
+    Notes
+    -----
+    This function differs from `bcast_partition`, because
+    it depends on a Shuffler instance.
+    """
+    # Extract the input partition from the Shuffler
+    partition = _extract_shuffled_partition(
+        get_worker_context,
+        shuffler_id,
+        partition_id,
+        join_integration.get_shuffler_integration(),
+        options,
+    )
+
+    # Broadcast the partition to all workers
+    bcast_partition(
+        get_worker_context,
+        join_integration,
+        partition,
+        allgather_id,
+        options,
+    )
 
 
 def stage_partitions(
@@ -679,9 +760,9 @@ class FetchJoinChunk(Generic[DataFrameT]):
         The side of the join being fetched.
     output_partition_id
         The output partition id for the join operation.
-    get_context
+    get_worker_context
         Callable function to fetch the worker context.
-    integration
+    join_integration
         The JoinIntegration protocol to use.
     op_id
         The operation id.
@@ -706,7 +787,7 @@ class FetchJoinChunk(Generic[DataFrameT]):
         side: Literal["left", "right"],
         output_partition_id: int,
         get_worker_context: Callable[..., WorkerContext],
-        integration: JoinIntegration[DataFrameT],
+        join_integration: JoinIntegration[DataFrameT],
         op_id: int | None,
         barrier: DataFrameT | tuple[int, ...],
         bcast_info: BCastJoinInfo | None,
@@ -716,7 +797,7 @@ class FetchJoinChunk(Generic[DataFrameT]):
         self.side = side
         self.output_partition_id = output_partition_id
         self.get_worker_context = get_worker_context
-        self.integration = integration
+        self.join_integration = join_integration
         self.op_id = op_id
         self.barrier = barrier
         self.bcast_info = bcast_info
@@ -726,25 +807,18 @@ class FetchJoinChunk(Generic[DataFrameT]):
     @cached_property
     def _data(self) -> dict[int, DataFrameT]:
         """Return a dictionary of DataFrame chunks."""
-        op_id = self.op_id
         data: DataFrameT
-        if op_id is None:
+        if self.op_id is None:
             assert not isinstance(self.barrier, tuple), "Barrier must be a DataFrame."
             data = self.barrier
         else:
-            ctx = self.get_worker_context()
-            shuffler = get_shuffler(ctx, op_id)
-            try:
-                data = self.integration.get_shuffler_integration().extract_partition(
-                    self.output_partition_id,
-                    shuffler,
-                    self.options,
-                )
-            finally:
-                if shuffler.finished():
-                    with ctx.lock:
-                        if op_id in ctx.shufflers:
-                            del ctx.shufflers[op_id]
+            data = _extract_shuffled_partition(
+                self.get_worker_context,
+                self.op_id,
+                self.output_partition_id,
+                self.join_integration.get_shuffler_integration(),
+                self.options,
+            )
 
         if (
             self.bcast_info is None
@@ -753,7 +827,7 @@ class FetchJoinChunk(Generic[DataFrameT]):
         ):
             return {0: data}
         else:
-            return self.integration.local_repartition(
+            return self.join_integration.local_repartition(
                 data, self.bcast_info.bcast_count, self.options
             )
 
@@ -821,8 +895,8 @@ class FetchJoinChunk(Generic[DataFrameT]):
 
 
 def join_partition(
-    get_context: Callable[..., WorkerContext],
-    integration: JoinIntegration[DataFrameT],
+    get_worker_context: Callable[..., WorkerContext],
+    join_integration: JoinIntegration[DataFrameT],
     bcast_info: BCastJoinInfo | None,
     left_op_id: int | None,
     right_op_id: int | None,
@@ -839,9 +913,9 @@ def join_partition(
 
     Parameters
     ----------
-    get_context
+    get_worker_context
         Callable function to fetch the worker context.
-    integration
+    join_integration
         The JoinIntegration protocol to use.
     bcast_info
         The broadcast join information.
@@ -898,8 +972,8 @@ def join_partition(
         return FetchJoinChunk(
             side,
             part_id,
-            get_context,
-            integration,
+            get_worker_context,
+            join_integration,
             op_id,
             barrier,
             bcast_info,
@@ -907,7 +981,7 @@ def join_partition(
             options,
         )
 
-    return integration.join_partition(
+    return join_integration.join_partition(
         _get_input("left"),
         _get_input("right"),
         bcast_info,

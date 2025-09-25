@@ -364,7 +364,7 @@ def rapidsmpf_shuffle_graph(
         graph[output_keys[-1]] = (
             extract_partition,
             get_worker_context,
-            integration.extract_partition,
+            integration,
             shuffle_id,
             part_id,
             shuffled_name,
