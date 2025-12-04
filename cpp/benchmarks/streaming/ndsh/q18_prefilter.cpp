@@ -67,7 +67,7 @@
 #include <rapidsmpf/streaming/coll/allgather.hpp>
 #include <rapidsmpf/streaming/core/channel.hpp>
 #include <rapidsmpf/streaming/core/context.hpp>
-#include <rapidsmpf/streaming/core/leaf_node.hpp>
+#include <rapidsmpf/streaming/core/fanout.hpp>
 #include <rapidsmpf/streaming/core/node.hpp>
 #include <rapidsmpf/streaming/cudf/parquet.hpp>
 #include <rapidsmpf/streaming/cudf/table_chunk.hpp>
@@ -155,6 +155,10 @@ rapidsmpf::streaming::Node chunkwise_groupby_lineitem(
     rapidsmpf::streaming::ShutdownAtExit c{ch_in, ch_out};
     auto mr = ctx->br()->device_mr();
     std::uint64_t sequence = 0;
+    std::size_t total_input_rows = 0;
+    std::size_t total_output_rows = 0;
+
+    ctx->comm()->logger().print("chunkwise_groupby_lineitem: starting");
 
     while (true) {
         auto msg = co_await ch_in->receive();
@@ -167,6 +171,7 @@ rapidsmpf::streaming::Node chunkwise_groupby_lineitem(
         );
         auto chunk_stream = chunk.stream();
         auto table = chunk.table_view();
+        total_input_rows += static_cast<std::size_t>(table.num_rows());
 
         // Groupby l_orderkey, sum(l_quantity) - NO FILTER
         auto grouper = cudf::groupby::groupby(
@@ -185,6 +190,19 @@ rapidsmpf::streaming::Node chunkwise_groupby_lineitem(
             std::ranges::move(r.results, std::back_inserter(result_columns));
         }
         auto grouped_table = std::make_unique<cudf::table>(std::move(result_columns));
+        total_output_rows += static_cast<std::size_t>(grouped_table->num_rows());
+
+        if (sequence % 5 == 0) {
+            ctx->comm()->logger().print(
+                "chunkwise_groupby_lineitem: processed ",
+                sequence + 1,
+                " chunks, ",
+                total_input_rows,
+                " input rows -> ",
+                total_output_rows,
+                " partial aggs"
+            );
+        }
 
         if (grouped_table->num_rows() > 0) {
             co_await ch_out->send(
@@ -197,6 +215,14 @@ rapidsmpf::streaming::Node chunkwise_groupby_lineitem(
             );
         }
     }
+
+    ctx->comm()->logger().print(
+        "chunkwise_groupby_lineitem: done. ",
+        total_input_rows,
+        " rows -> ",
+        total_output_rows,
+        " partial aggregates"
+    );
     co_await ch_out->drain(ctx->executor());
 }
 
@@ -282,11 +308,20 @@ rapidsmpf::streaming::Node final_groupby_filter_lineitem(
     );
 
     if (filtered_table->num_rows() > 0) {
+        // Extract just the orderkey column (column 0) - that's all downstream needs
+        std::vector<std::unique_ptr<cudf::column>> cols;
+        cols.push_back(
+            std::make_unique<cudf::column>(
+                filtered_table->view().column(0), chunk_stream, mr
+            )
+        );
+        auto orderkeys_only = std::make_unique<cudf::table>(std::move(cols));
+
         co_await ch_out->send(
             rapidsmpf::streaming::to_message(
                 0,
                 std::make_unique<rapidsmpf::streaming::TableChunk>(
-                    std::move(filtered_table), chunk_stream
+                    std::move(orderkeys_only), chunk_stream
                 )
             )
         );
@@ -372,94 +407,6 @@ rapidsmpf::streaming::Node allgather_partial_aggregates(
     co_await ch_out->drain(ctx->executor());
 }
 
-/**
- * @brief Phase 1: Compute qualifying orderkeys.
- *
- * Three-stage pipeline:
- * 1. Read lineitem → chunkwise_groupby (partial aggregates, no filter)
- * 2. Concatenate → all-gather across ranks
- * 3. Final groupby + filter (merge partials, then filter sum > 300)
- *
- * @return Table with single column (l_orderkey) of qualifying orders, or nullptr if
- * empty.
- */
-std::unique_ptr<cudf::table> compute_qualifying_orderkeys(
-    std::shared_ptr<rapidsmpf::streaming::Context> ctx,
-    cudf::size_type num_rows_per_chunk,
-    std::string const& input_directory,
-    double quantity_threshold,
-    rapidsmpf::OpID allgather_tag
-) {
-    ctx->comm()->logger().print("Phase 1: Computing qualifying orderkeys (3-stage)");
-
-    // Build Phase 1 pipeline
-    std::vector<rapidsmpf::streaming::Node> nodes;
-
-    // Stage 1: Read lineitem → chunk-wise groupby (partial aggregates)
-    auto lineitem = ctx->create_channel();
-    nodes.push_back(read_lineitem(ctx, lineitem, 4, num_rows_per_chunk, input_directory));
-
-    auto partial_aggs = ctx->create_channel();
-    nodes.push_back(chunkwise_groupby_lineitem(ctx, lineitem, partial_aggs));
-
-    // Stage 2: Concatenate locally → all-gather across ranks
-    auto concatenated = ctx->create_channel();
-    nodes.push_back(
-        rapidsmpf::ndsh::concatenate(
-            ctx, partial_aggs, concatenated, rapidsmpf::ndsh::ConcatOrder::DONT_CARE
-        )
-    );
-
-    auto gathered = ctx->create_channel();
-    nodes.push_back(
-        allgather_partial_aggregates(ctx, concatenated, gathered, allgather_tag)
-    );
-
-    // Stage 3: Final groupby + filter
-    auto final_result_channel = ctx->create_channel();
-    nodes.push_back(final_groupby_filter_lineitem(
-        ctx, gathered, final_result_channel, quantity_threshold
-    ));
-
-    // Collect result using pull_from_channel (safe coroutine pattern)
-    std::vector<rapidsmpf::streaming::Message> result_messages;
-    nodes.push_back(
-        rapidsmpf::streaming::node::pull_from_channel(
-            ctx, final_result_channel, result_messages
-        )
-    );
-
-    // Run pipeline
-    rapidsmpf::streaming::run_streaming_pipeline(std::move(nodes));
-
-    // Extract result from collected messages
-    std::unique_ptr<cudf::table> result;
-    if (!result_messages.empty()) {
-        auto chunk = rapidsmpf::ndsh::to_device(
-            ctx, result_messages[0].release<rapidsmpf::streaming::TableChunk>()
-        );
-        auto stream = chunk.stream();
-        auto table_view = chunk.table_view();
-
-        // Extract just the orderkey column (column 0)
-        // The filtered result has (l_orderkey, sum_quantity), we only need l_orderkey
-        std::vector<std::unique_ptr<cudf::column>> cols;
-        cols.push_back(
-            std::make_unique<cudf::column>(
-                table_view.column(0), stream, ctx->br()->device_mr()
-            )
-        );
-        stream.synchronize();
-        result = std::make_unique<cudf::table>(std::move(cols));
-    }
-
-    ctx->comm()->logger().print(
-        "Phase 1 complete: ", result ? result->num_rows() : 0, " qualifying orderkeys"
-    );
-
-    return result;
-}
-
 // ============================================================================
 // Phase 2: Pre-filter Pipeline
 // ============================================================================
@@ -467,22 +414,50 @@ std::unique_ptr<cudf::table> compute_qualifying_orderkeys(
 /**
  * @brief Pre-filter table by qualifying orderkeys using semi-join.
  *
- * @param qualifying_orderkeys Table with single column of qualifying l_orderkey values.
+ * This node first receives the qualifying orderkeys from ch_orderkeys,
+ * builds a hash table, then filters all incoming data chunks from ch_data.
+ *
+ * @param ch_orderkeys Channel providing the qualifying orderkeys (single message
+ * expected)
+ * @param ch_data Channel providing data chunks to filter
+ * @param ch_out Channel for filtered output
  * @param key_column_idx Which column in input chunks to match against orderkeys.
  */
 rapidsmpf::streaming::Node prefilter_by_orderkeys(
     std::shared_ptr<rapidsmpf::streaming::Context> ctx,
-    std::shared_ptr<rapidsmpf::streaming::Channel> ch_in,
+    std::shared_ptr<rapidsmpf::streaming::Channel> ch_orderkeys,
+    std::shared_ptr<rapidsmpf::streaming::Channel> ch_data,
     std::shared_ptr<rapidsmpf::streaming::Channel> ch_out,
-    std::shared_ptr<cudf::table> qualifying_orderkeys,
     cudf::size_type key_column_idx
 ) {
-    rapidsmpf::streaming::ShutdownAtExit c{ch_in, ch_out};
+    rapidsmpf::streaming::ShutdownAtExit c{ch_orderkeys, ch_data, ch_out};
     std::uint64_t sequence = 0;
+
+    // First, receive the qualifying orderkeys
+    auto orderkeys_msg = co_await ch_orderkeys->receive();
+    if (orderkeys_msg.empty()) {
+        // No qualifying orderkeys - drain data and exit
+        while (true) {
+            auto msg = co_await ch_data->receive();
+            if (msg.empty())
+                break;
+        }
+        co_await ch_out->drain(ctx->executor());
+        co_return;
+    }
+
+    auto orderkeys_chunk = rapidsmpf::ndsh::to_device(
+        ctx, orderkeys_msg.release<rapidsmpf::streaming::TableChunk>()
+    );
+    ctx->comm()->logger().print(
+        "prefilter: received ",
+        orderkeys_chunk.table_view().num_rows(),
+        " qualifying orderkeys"
+    );
 
     // Build filtered_join for semi-join (orderkeys is the "right"/build side)
     auto joiner = cudf::filtered_join(
-        qualifying_orderkeys->view(),
+        orderkeys_chunk.table_view(),
         cudf::null_equality::UNEQUAL,
         cudf::set_as_build_table::RIGHT,
         cudf::get_default_stream()
@@ -492,7 +467,7 @@ rapidsmpf::streaming::Node prefilter_by_orderkeys(
     std::size_t total_output_rows = 0;
 
     while (true) {
-        auto msg = co_await ch_in->receive();
+        auto msg = co_await ch_data->receive();
         if (msg.empty()) {
             break;
         }
@@ -735,6 +710,52 @@ rapidsmpf::streaming::Node reorder_columns(
     co_await ch_out->drain(ctx->executor());
 }
 
+/**
+ * @brief Spillable buffer node.
+ *
+ * Accumulates all incoming messages in a spillable container.
+ * Once input is exhausted, forwards all messages to output.
+ * The spill manager can spill buffered messages to host if needed.
+ */
+rapidsmpf::streaming::Node spillable_buffer(
+    std::shared_ptr<rapidsmpf::streaming::Context> ctx,
+    std::shared_ptr<rapidsmpf::streaming::Channel> ch_in,
+    std::shared_ptr<rapidsmpf::streaming::Channel> ch_out
+) {
+    rapidsmpf::streaming::ShutdownAtExit c{ch_in, ch_out};
+    ctx->comm()->logger().print("spillable_buffer: starting");
+
+    auto spillable = ctx->spillable_messages();
+    std::vector<rapidsmpf::streaming::SpillableMessages::MessageId> message_ids;
+
+    while (true) {
+        auto msg = co_await ch_in->receive();
+        if (msg.empty()) {
+            break;
+        }
+        co_await ctx->executor()->schedule();
+        auto id = spillable->insert(std::move(msg));
+        message_ids.push_back(id);
+
+        if (message_ids.size() % 10 == 0) {
+            ctx->comm()->logger().print(
+                "spillable_buffer: buffered ", message_ids.size(), " messages"
+            );
+        }
+    }
+
+    ctx->comm()->logger().print(
+        "spillable_buffer: forwarding ", message_ids.size(), " messages"
+    );
+
+    for (auto id : message_ids) {
+        auto msg = spillable->extract(id);
+        co_await ch_out->send(std::move(msg));
+    }
+
+    co_await ch_out->drain(ctx->executor());
+}
+
 rapidsmpf::streaming::Node chunkwise_groupby_agg(
     std::shared_ptr<rapidsmpf::streaming::Context> ctx,
     std::shared_ptr<rapidsmpf::streaming::Channel> ch_in,
@@ -940,8 +961,9 @@ rapidsmpf::streaming::Node write_parquet(
 // ============================================================================
 
 struct ProgramOptions {
-    int num_streaming_threads{1};
+    int num_streaming_threads{4};  // Increased default for better parallelism
     cudf::size_type num_rows_per_chunk{100'000'000};
+    std::uint32_t num_partitions{64};  // Number of shuffle partitions
     std::optional<double> spill_device_limit{std::nullopt};
     std::string output_file;
     std::string input_directory;
@@ -954,9 +976,11 @@ ProgramOptions parse_options(int argc, char** argv) {
         std::cerr
             << "Usage: " << argv[0] << " [options]\n"
             << "Options:\n"
-            << "  --num-streaming-threads <n>  Number of streaming threads (default: 1)\n"
+            << "  --num-streaming-threads <n>  Number of streaming threads (default: 4)\n"
             << "  --num-rows-per-chunk <n>     Number of rows per chunk (default: "
                "100000000)\n"
+            << "  --num-partitions <n>         Number of shuffle partitions (default: "
+               "64)\n"
             << "  --spill-device-limit <n>     Fractional spill device limit (default: "
                "None)\n"
             << "  --output-file <path>         Output file path (required)\n"
@@ -971,6 +995,7 @@ ProgramOptions parse_options(int argc, char** argv) {
         {"input-directory", required_argument, nullptr, 4},
         {"help", no_argument, nullptr, 5},
         {"spill-device-limit", required_argument, nullptr, 6},
+        {"num-partitions", required_argument, nullptr, 7},
         {nullptr, 0, nullptr, 0}
     };
 
@@ -1000,6 +1025,9 @@ ProgramOptions parse_options(int argc, char** argv) {
             std::exit(0);
         case 6:
             options.spill_device_limit = std::stod(optarg);
+            break;
+        case 7:
+            options.num_partitions = static_cast<std::uint32_t>(std::atoi(optarg));
             break;
         default:
             print_usage();
@@ -1075,43 +1103,112 @@ int main(int argc, char** argv) {
             auto start = std::chrono::steady_clock::now();
 
             // ================================================================
-            // Phase 1: Compute qualifying orderkeys (blocking)
-            // ================================================================
-            auto qualifying_orderkeys = compute_qualifying_orderkeys(
-                ctx,
-                cmd_options.num_rows_per_chunk,
-                cmd_options.input_directory,
-                300.0,  // quantity_threshold
-                rapidsmpf::OpID{static_cast<rapidsmpf::OpID>(100 + iteration)}
-            );
-
-            if (!qualifying_orderkeys || qualifying_orderkeys->num_rows() == 0) {
-                comm->logger().print("No qualifying orderkeys found - empty result");
-                continue;
-            }
-
-            // Share orderkeys across nodes (they're small and identical on all ranks)
-            auto shared_orderkeys =
-                std::make_shared<cudf::table>(std::move(*qualifying_orderkeys));
-
-            // ================================================================
-            // Phase 2: Build pre-filtered pipeline
+            // UNIFIED PIPELINE (Single Lineitem Read)
             // ================================================================
             std::vector<rapidsmpf::streaming::Node> nodes;
 
-            // Read and pre-filter lineitem
-            auto lineitem_raw = ctx->create_channel();
+            // ----------------------------------------------------------------
+            // Read lineitem ONCE and fanout to groupby + spillable_buffer
+            // ----------------------------------------------------------------
+            auto lineitem = ctx->create_channel();
             nodes.push_back(read_lineitem(
                 ctx,
-                lineitem_raw,
-                4,
+                lineitem,
+                4,  // More producers for better parallelism
                 cmd_options.num_rows_per_chunk,
                 cmd_options.input_directory
             ));
 
+            // Fanout lineitem to: (1) groupby path, (2) spillable buffer for prefilter
+            auto lineitem_for_groupby = ctx->create_channel();
+            auto lineitem_for_buffer = ctx->create_channel();
+            nodes.push_back(
+                rapidsmpf::streaming::node::fanout(
+                    ctx,
+                    lineitem,
+                    {lineitem_for_groupby, lineitem_for_buffer},
+                    rapidsmpf::streaming::node::FanoutPolicy::UNBOUNDED
+                )
+            );
+
+            // Spillable buffer holds lineitem data while Phase 1 runs
+            auto lineitem_buffered = ctx->create_channel();
+            nodes.push_back(
+                spillable_buffer(ctx, lineitem_for_buffer, lineitem_buffered)
+            );
+
+            // ----------------------------------------------------------------
+            // Phase 1: Compute qualifying orderkeys
+            // groupby -> SHUFFLE(by orderkey) -> final_groupby_filter -> allgather(tiny)
+            // ----------------------------------------------------------------
+            std::uint32_t num_partitions = cmd_options.num_partitions;
+
+            auto partial_aggs = ctx->create_channel();
+            nodes.push_back(
+                chunkwise_groupby_lineitem(ctx, lineitem_for_groupby, partial_aggs)
+            );
+
+            // SHUFFLE partial aggregates by orderkey (distributes work!)
+            auto partial_aggs_shuffled = ctx->create_channel();
+            nodes.push_back(
+                rapidsmpf::ndsh::shuffle(
+                    ctx,
+                    partial_aggs,
+                    partial_aggs_shuffled,
+                    {0},  // l_orderkey
+                    num_partitions,
+                    rapidsmpf::OpID{static_cast<rapidsmpf::OpID>(100 + iteration)}
+                )
+            );
+
+            // Each partition: concat -> groupby -> filter
+            auto partial_aggs_concat = ctx->create_channel();
+            nodes.push_back(
+                rapidsmpf::ndsh::concatenate(
+                    ctx,
+                    partial_aggs_shuffled,
+                    partial_aggs_concat,
+                    rapidsmpf::ndsh::ConcatOrder::DONT_CARE
+                )
+            );
+
+            // Final groupby + filter per partition (parallel across ranks!)
+            auto qualifying_orderkeys_local = ctx->create_channel();
+            nodes.push_back(final_groupby_filter_lineitem(
+                ctx, partial_aggs_concat, qualifying_orderkeys_local, 300.0
+            ));
+
+            // All-gather ONLY the tiny result (~5.7K orderkeys at SF300)
+            auto qualifying_orderkeys = ctx->create_channel();
+            nodes.push_back(allgather_partial_aggregates(
+                ctx,
+                qualifying_orderkeys_local,
+                qualifying_orderkeys,
+                rapidsmpf::OpID{static_cast<rapidsmpf::OpID>(101 + iteration)}
+            ));
+
+            // ----------------------------------------------------------------
+            // Fanout qualifying orderkeys to prefilter nodes
+            // ----------------------------------------------------------------
+            auto orderkeys_for_lineitem = ctx->create_channel();
+            auto orderkeys_for_orders = ctx->create_channel();
+            nodes.push_back(
+                rapidsmpf::streaming::node::fanout(
+                    ctx,
+                    qualifying_orderkeys,
+                    {orderkeys_for_lineitem, orderkeys_for_orders},
+                    rapidsmpf::streaming::node::FanoutPolicy::BOUNDED
+                )
+            );
+
+            // ----------------------------------------------------------------
+            // Phase 2: Pre-filter lineitem (from buffer) and orders, then join
+            // ----------------------------------------------------------------
+
+            // Pre-filter lineitem from spillable buffer
             auto lineitem_filtered = ctx->create_channel();
             nodes.push_back(prefilter_by_orderkeys(
-                ctx, lineitem_raw, lineitem_filtered, shared_orderkeys, 0
+                ctx, orderkeys_for_lineitem, lineitem_buffered, lineitem_filtered, 0
             ));
 
             auto lineitem_concat = ctx->create_channel();
@@ -1132,19 +1229,19 @@ int main(int argc, char** argv) {
                 rapidsmpf::OpID{static_cast<rapidsmpf::OpID>(200 + iteration)}
             ));
 
-            // Read and pre-filter orders
+            // Read orders and pre-filter
             auto orders_raw = ctx->create_channel();
             nodes.push_back(read_orders(
                 ctx,
                 orders_raw,
-                4,
+                1,
                 cmd_options.num_rows_per_chunk,
                 cmd_options.input_directory
             ));
 
             auto orders_filtered = ctx->create_channel();
             nodes.push_back(prefilter_by_orderkeys(
-                ctx, orders_raw, orders_filtered, shared_orderkeys, 0
+                ctx, orderkeys_for_orders, orders_raw, orders_filtered, 0
             ));
 
             auto orders_concat = ctx->create_channel();
@@ -1181,7 +1278,7 @@ int main(int argc, char** argv) {
             nodes.push_back(read_customer(
                 ctx,
                 customer,
-                4,
+                1,
                 cmd_options.num_rows_per_chunk,
                 cmd_options.input_directory
             ));
