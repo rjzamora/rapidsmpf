@@ -85,25 +85,25 @@ cdef extern from * nogil:
         );
     }
 
-    coro::task<void> _insert_finished_task(
-        rapidsmpf::streaming::ShufflerAsync *shuffle,
+    coro::task<void> _run_node_task(
+        rapidsmpf::streaming::Node node,
         void (*py_invoker)(void*),
         rapidsmpf::OwningWrapper py_callback
     ) {
-        co_await shuffle->insert_finished();
+        co_await node;
         py_invoker(py_callback.get());
     }
 
-    void cpp_insert_finished(
+    void cpp_run_node(
         std::shared_ptr<rapidsmpf::streaming::Context> ctx,
-        rapidsmpf::streaming::ShufflerAsync *shuffle,
+        rapidsmpf::streaming::Node node,
         void (*py_invoker)(void*),
         rapidsmpf::OwningWrapper py_callback
     ) {
         RAPIDSMPF_EXPECTS(
             ctx->executor()->spawn(
-                 _insert_finished_task(
-                     shuffle, py_invoker, std::move(py_callback)
+                 _run_node_task(
+                     std::move(node), py_invoker, std::move(py_callback)
                  )
             ),
             "could not spawn task on thread pool"
@@ -128,9 +128,9 @@ cdef extern from * nogil:
         cpp_OwningWrapper py_callback,
     ) except +
 
-    void cpp_insert_finished(
+    void cpp_run_node(
         shared_ptr[cpp_Context] ctx,
-        cpp_ShufflerAsync *shuffle,
+        cpp_Node node,
         void (*py_invoker)(void*),
         cpp_OwningWrapper py_callback,
     ) except +
@@ -231,7 +231,8 @@ cdef class ShufflerAsync:
             cpp_insert_chunk_into_partition_map(
                 c_chunks, pid, move((<PackedData>chunk).c_obj)
             )
-        deref(self._handle).insert(move(c_chunks))
+        with nogil:
+            deref(self._handle).insert(move(c_chunks))
 
     async def insert_finished(self, Context ctx not None):
         """
@@ -239,16 +240,21 @@ cdef class ShufflerAsync:
 
         Notes
         -----
-        This must be awaited before extraction can occur.
+        This completes the insert_finished() operation and waits for all
+        shuffle notifications to drain properly. This MUST be awaited before
+        the shuffler is destroyed, otherwise the destructor will terminate.
         """
         loop = asyncio.get_running_loop()
         ret = loop.create_future()
         callback = partial(loop.call_soon_threadsafe, partial(ret.set_result, None))
         Py_INCREF(callback)
+        # Get the finish node and run it
+        cdef cpp_Node node
+        node = deref(self._handle).insert_finished()
         with nogil:
-            cpp_insert_finished(
+            cpp_run_node(
                 ctx._handle,
-                self._handle.get(),
+                move(node),
                 cython_invoke_python_function,
                 move(cpp_OwningWrapper(<void*><PyObject*>callback, py_deleter))
             )
