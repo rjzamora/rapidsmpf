@@ -85,25 +85,25 @@ cdef extern from * nogil:
         );
     }
 
-    coro::task<void> _run_node_task(
-        rapidsmpf::streaming::Node node,
+    coro::task<void> _insert_finished_task(
+        rapidsmpf::streaming::ShufflerAsync *shuffle,
         void (*py_invoker)(void*),
         rapidsmpf::OwningWrapper py_callback
     ) {
-        co_await node;
+        co_await shuffle->insert_finished();
         py_invoker(py_callback.get());
     }
 
-    void cpp_run_node(
+    void cpp_insert_finished(
         std::shared_ptr<rapidsmpf::streaming::Context> ctx,
-        rapidsmpf::streaming::Node node,
+        rapidsmpf::streaming::ShufflerAsync *shuffle,
         void (*py_invoker)(void*),
         rapidsmpf::OwningWrapper py_callback
     ) {
         RAPIDSMPF_EXPECTS(
             ctx->executor()->spawn(
-                 _run_node_task(
-                     std::move(node), py_invoker, std::move(py_callback)
+                 _insert_finished_task(
+                     shuffle, py_invoker, std::move(py_callback)
                  )
             ),
             "could not spawn task on thread pool"
@@ -128,9 +128,9 @@ cdef extern from * nogil:
         cpp_OwningWrapper py_callback,
     ) except +
 
-    void cpp_run_node(
+    void cpp_insert_finished(
         shared_ptr[cpp_Context] ctx,
-        cpp_Node node,
+        cpp_ShufflerAsync *shuffle,
         void (*py_invoker)(void*),
         cpp_OwningWrapper py_callback,
     ) except +
@@ -240,21 +240,16 @@ cdef class ShufflerAsync:
 
         Notes
         -----
-        This completes the insert_finished() operation and waits for all
-        shuffle notifications to drain properly. This MUST be awaited before
-        the shuffler is destroyed, otherwise the destructor will terminate.
+        This must be awaited before extraction can occur.
         """
         loop = asyncio.get_running_loop()
         ret = loop.create_future()
         callback = partial(loop.call_soon_threadsafe, partial(ret.set_result, None))
         Py_INCREF(callback)
-        # Get the finish node and run it
-        cdef cpp_Node node
-        node = deref(self._handle).insert_finished()
         with nogil:
-            cpp_run_node(
+            cpp_insert_finished(
                 ctx._handle,
-                move(node),
+                self._handle.get(),
                 cython_invoke_python_function,
                 move(cpp_OwningWrapper(<void*><PyObject*>callback, py_deleter))
             )
