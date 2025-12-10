@@ -130,12 +130,33 @@ std::string get_table_path(
 // Table Readers
 // ============================================================================
 
+/**
+ * @brief Get target chunk count for lineitem table.
+ *
+ * Caches the result to avoid re-reading metadata on subsequent calls.
+ */
+std::size_t get_lineitem_target_chunks(
+    std::string const& input_directory, cudf::size_type num_rows_per_chunk
+) {
+    static std::optional<std::size_t> cached;
+    if (!cached.has_value()) {
+        auto files = rapidsmpf::ndsh::detail::list_parquet_files(
+            get_table_path(input_directory, "lineitem")
+        );
+        cached = rapidsmpf::streaming::node::estimate_target_num_chunks(
+            files, num_rows_per_chunk
+        );
+    }
+    return cached.value();
+}
+
 rapidsmpf::streaming::Node read_lineitem(
     std::shared_ptr<rapidsmpf::streaming::Context> ctx,
     std::shared_ptr<rapidsmpf::streaming::Channel> ch_out,
     std::size_t num_producers,
     cudf::size_type num_rows_per_chunk,
-    std::string const& input_directory
+    std::string const& input_directory,
+    bool use_uniform_parquet = false
 ) {
     auto files = rapidsmpf::ndsh::detail::list_parquet_files(
         get_table_path(input_directory, "lineitem")
@@ -143,6 +164,22 @@ rapidsmpf::streaming::Node read_lineitem(
     auto options = cudf::io::parquet_reader_options::builder(cudf::io::source_info(files))
                        .columns({"l_orderkey", "l_quantity"})
                        .build();
+    if (use_uniform_parquet) {
+        auto target_chunks =
+            get_lineitem_target_chunks(input_directory, num_rows_per_chunk);
+        ctx->comm()->logger().print(
+            "read_lineitem: ",
+            files.size(),
+            " files, target_chunks=",
+            target_chunks,
+            " (rows_per_chunk=",
+            num_rows_per_chunk,
+            ")"
+        );
+        return rapidsmpf::streaming::node::read_parquet_uniform(
+            ctx, ch_out, num_producers, options, target_chunks
+        );
+    }
     return rapidsmpf::streaming::node::read_parquet(
         ctx, ch_out, num_producers, options, num_rows_per_chunk
     );
@@ -153,7 +190,8 @@ rapidsmpf::streaming::Node read_orders(
     std::shared_ptr<rapidsmpf::streaming::Channel> ch_out,
     std::size_t num_producers,
     cudf::size_type num_rows_per_chunk,
-    std::string const& input_directory
+    std::string const& input_directory,
+    bool use_uniform_parquet = false
 ) {
     auto files = rapidsmpf::ndsh::detail::list_parquet_files(
         get_table_path(input_directory, "orders")
@@ -162,6 +200,23 @@ rapidsmpf::streaming::Node read_orders(
         cudf::io::parquet_reader_options::builder(cudf::io::source_info(files))
             .columns({"o_orderkey", "o_custkey", "o_orderdate", "o_totalprice"})
             .build();
+    if (use_uniform_parquet) {
+        auto target_chunks = rapidsmpf::streaming::node::estimate_target_num_chunks(
+            files, num_rows_per_chunk
+        );
+        ctx->comm()->logger().print(
+            "read_orders: ",
+            files.size(),
+            " files, target_chunks=",
+            target_chunks,
+            " (rows_per_chunk=",
+            num_rows_per_chunk,
+            ")"
+        );
+        return rapidsmpf::streaming::node::read_parquet_uniform(
+            ctx, ch_out, num_producers, options, target_chunks
+        );
+    }
     return rapidsmpf::streaming::node::read_parquet(
         ctx, ch_out, num_producers, options, num_rows_per_chunk
     );
@@ -172,7 +227,8 @@ rapidsmpf::streaming::Node read_customer(
     std::shared_ptr<rapidsmpf::streaming::Channel> ch_out,
     std::size_t num_producers,
     cudf::size_type num_rows_per_chunk,
-    std::string const& input_directory
+    std::string const& input_directory,
+    bool use_uniform_parquet = false
 ) {
     auto files = rapidsmpf::ndsh::detail::list_parquet_files(
         get_table_path(input_directory, "customer")
@@ -180,6 +236,23 @@ rapidsmpf::streaming::Node read_customer(
     auto options = cudf::io::parquet_reader_options::builder(cudf::io::source_info(files))
                        .columns({"c_custkey", "c_name"})
                        .build();
+    if (use_uniform_parquet) {
+        auto target_chunks = rapidsmpf::streaming::node::estimate_target_num_chunks(
+            files, num_rows_per_chunk
+        );
+        ctx->comm()->logger().print(
+            "read_customer: ",
+            files.size(),
+            " files, target_chunks=",
+            target_chunks,
+            " (rows_per_chunk=",
+            num_rows_per_chunk,
+            ")"
+        );
+        return rapidsmpf::streaming::node::read_parquet_uniform(
+            ctx, ch_out, num_producers, options, target_chunks
+        );
+    }
     return rapidsmpf::streaming::node::read_parquet(
         ctx, ch_out, num_producers, options, num_rows_per_chunk
     );
@@ -468,7 +541,8 @@ std::unique_ptr<cudf::table> compute_qualifying_orderkeys(
     std::string const& input_directory,
     double quantity_threshold,
     std::uint32_t num_partitions,
-    rapidsmpf::OpID base_tag
+    rapidsmpf::OpID base_tag,
+    bool use_uniform_parquet = false
 ) {
     bool const single_rank = ctx->comm()->nranks() == 1;
     ctx->comm()->logger().print(
@@ -481,7 +555,9 @@ std::unique_ptr<cudf::table> compute_qualifying_orderkeys(
 
     // Stage 1: Read lineitem → chunk-wise groupby (partial aggregates)
     auto lineitem = ctx->create_channel();
-    nodes.push_back(read_lineitem(ctx, lineitem, 4, num_rows_per_chunk, input_directory));
+    nodes.push_back(read_lineitem(
+        ctx, lineitem, 4, num_rows_per_chunk, input_directory, use_uniform_parquet
+    ));
 
     auto partial_aggs = ctx->create_channel();
     nodes.push_back(chunkwise_groupby_lineitem(ctx, lineitem, partial_aggs));
@@ -1001,6 +1077,9 @@ struct ProgramOptions {
     cudf::size_type num_rows_per_chunk{100'000'000};
     std::uint32_t num_partitions{64};
     bool use_shuffle{false};  // Use shuffle joins in Phase 2 for multi-GPU scaling
+    bool use_uniform_parquet{
+        false
+    };  // Use read_parquet_uniform for better file splitting
     std::optional<double> spill_device_limit{std::nullopt};
     std::string output_file;
     std::string input_directory;
@@ -1020,6 +1099,8 @@ ProgramOptions parse_options(int argc, char** argv) {
                "64)\n"
             << "  --use-shuffle                Use shuffle joins in Phase 2 for "
                "multi-GPU scaling\n"
+            << "  --uniform-parquet            Use read_parquet_uniform for better "
+               "file splitting across ranks\n"
             << "  --spill-device-limit <n>     Fractional spill device limit (default: "
                "None)\n"
             << "  --output-file <path>         Output file path (required)\n"
@@ -1032,6 +1113,7 @@ ProgramOptions parse_options(int argc, char** argv) {
         {"num-rows-per-chunk", required_argument, nullptr, 2},
         {"num-partitions", required_argument, nullptr, 7},
         {"use-shuffle", no_argument, nullptr, 8},
+        {"uniform-parquet", no_argument, nullptr, 9},
         {"output-file", required_argument, nullptr, 3},
         {"input-directory", required_argument, nullptr, 4},
         {"help", no_argument, nullptr, 5},
@@ -1071,6 +1153,9 @@ ProgramOptions parse_options(int argc, char** argv) {
             break;
         case 8:
             options.use_shuffle = true;
+            break;
+        case 9:
+            options.use_uniform_parquet = true;
             break;
         default:
             print_usage();
@@ -1145,7 +1230,9 @@ int main(int argc, char** argv) {
             ", Phase 2 mode: ",
             cmd_options.use_shuffle ? "shuffle joins" : "local joins",
             ", partitions: ",
-            cmd_options.num_partitions
+            cmd_options.num_partitions,
+            ", parquet reader: ",
+            cmd_options.use_uniform_parquet ? "uniform" : "standard"
         );
 
         std::string output_path = cmd_options.output_file;
@@ -1165,7 +1252,8 @@ int main(int argc, char** argv) {
                     cmd_options.input_directory,
                     300.0,  // quantity_threshold
                     cmd_options.num_partitions,
-                    rapidsmpf::OpID{static_cast<rapidsmpf::OpID>(100 + iteration * 10)}
+                    rapidsmpf::OpID{static_cast<rapidsmpf::OpID>(100 + iteration * 10)},
+                    cmd_options.use_uniform_parquet
                 );
             auto phase1_end = std::chrono::steady_clock::now();
 
@@ -1192,7 +1280,8 @@ int main(int argc, char** argv) {
                 lineitem_raw,
                 4,
                 cmd_options.num_rows_per_chunk,
-                cmd_options.input_directory
+                cmd_options.input_directory,
+                cmd_options.use_uniform_parquet
             ));
 
             auto lineitem_filtered = ctx->create_channel();
@@ -1207,7 +1296,8 @@ int main(int argc, char** argv) {
                 orders_raw,
                 4,
                 cmd_options.num_rows_per_chunk,
-                cmd_options.input_directory
+                cmd_options.input_directory,
+                cmd_options.use_uniform_parquet
             ));
 
             auto orders_filtered = ctx->create_channel();
@@ -1222,7 +1312,8 @@ int main(int argc, char** argv) {
                 customer,
                 4,
                 cmd_options.num_rows_per_chunk,
-                cmd_options.input_directory
+                cmd_options.input_directory,
+                cmd_options.use_uniform_parquet
             ));
 
             auto all_joined = ctx->create_channel();
