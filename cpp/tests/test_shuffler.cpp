@@ -71,6 +71,151 @@ TEST(ReceivedChunks, spill_respects_amount) {
     EXPECT_EQ(received.spill(br.get(), chunk_size), chunk_size);
 }
 
+namespace {
+
+using ReceivedChunks = rapidsmpf::shuffler::detail::ReceivedChunks;
+
+void wait_until_disk_idle(
+    ReceivedChunks& received, rapidsmpf::BufferResource* br = nullptr
+) {
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    while (!received.disk_idle() && std::chrono::steady_clock::now() < deadline) {
+        received.progress(br);
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    ASSERT_TRUE(received.disk_idle());
+}
+
+rapidsmpf::PackedData move_to_host(
+    rapidsmpf::PackedData packed_data,
+    rapidsmpf::BufferResource& br,
+    rmm::cuda_stream_view stream
+) {
+    auto res = br.reserve_or_fail(packed_data.data->size, rapidsmpf::MemoryType::HOST);
+    packed_data.data = br.move(std::move(packed_data.data), res);
+    RAPIDSMPF_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+    return packed_data;
+}
+
+rapidsmpf::PackedData release_packed_data(rapidsmpf::shuffler::detail::Chunk&& chunk) {
+    return rapidsmpf::PackedData{
+        chunk.release_metadata_buffer(), chunk.release_data_buffer()
+    };
+}
+
+}  // namespace
+
+TEST(ReceivedChunks, force_disk_stages_host_chunks) {
+    auto mr = rmm::mr::get_current_device_resource_ref();
+    auto br = rapidsmpf::BufferResource::create(mr);
+    auto stream = rmm::cuda_stream_default;
+    TempDir temp_dir;
+
+    ReceivedChunks received{
+        1,
+        ReceivedChunks::DiskOptions{
+            .mode = ReceivedChunks::DiskMode::FORCE,
+            .scratch_dir = temp_dir.path(),
+            .max_pending_write_bytes = 1_MiB,
+        }
+    };
+
+    auto packed_data =
+        move_to_host(generate_packed_data<int>(16, 7, stream, *br), *br, stream);
+    auto const data_size = packed_data.data->size;
+    received.insert(
+        rapidsmpf::shuffler::detail::Chunk::from_packed_data(0, 0, std::move(packed_data))
+    );
+
+    EXPECT_TRUE(received.disk_mode_enabled());
+    wait_until_disk_idle(received);
+    EXPECT_EQ(received.host_resident_bytes(), 0);
+    EXPECT_EQ(received.pending_disk_write_bytes(), 0);
+    EXPECT_EQ(received.disk_bytes(), data_size);
+
+    auto chunks = received.extract(0, br.get());
+    ASSERT_EQ(chunks.size(), 1);
+    validate_packed_data<int>(
+        release_packed_data(std::move(chunks.front())), 16, 7, stream, *br
+    );
+}
+
+TEST(ReceivedChunks, force_disk_stages_device_chunks) {
+    auto mr = rmm::mr::get_current_device_resource_ref();
+    auto br = rapidsmpf::BufferResource::create(mr);
+    auto stream = rmm::cuda_stream_default;
+    TempDir temp_dir;
+
+    ReceivedChunks received{
+        1,
+        ReceivedChunks::DiskOptions{
+            .mode = ReceivedChunks::DiskMode::FORCE,
+            .scratch_dir = temp_dir.path(),
+            .max_pending_write_bytes = 1_MiB,
+        }
+    };
+
+    auto packed_data = generate_packed_data<int>(16, 23, stream, *br);
+    auto const data_size = packed_data.data->size;
+    received.insert(
+        rapidsmpf::shuffler::detail::Chunk::from_packed_data(0, 0, std::move(packed_data))
+    );
+
+    EXPECT_TRUE(received.disk_mode_enabled());
+    wait_until_disk_idle(received, br.get());
+    EXPECT_EQ(received.device_resident_bytes(), 0);
+    EXPECT_EQ(received.host_resident_bytes(), 0);
+    EXPECT_EQ(received.pending_disk_write_bytes(), 0);
+    EXPECT_EQ(received.disk_bytes(), data_size);
+    EXPECT_GE(received.cumulative_non_device_bytes(), data_size);
+    EXPECT_EQ(received.cumulative_disk_write_bytes(), data_size);
+
+    auto chunks = received.extract(0, br.get());
+    ASSERT_EQ(chunks.size(), 1);
+    validate_packed_data<int>(
+        release_packed_data(std::move(chunks.front())), 16, 23, stream, *br
+    );
+    EXPECT_EQ(received.cumulative_disk_read_bytes(), data_size);
+}
+
+TEST(ReceivedChunks, auto_disk_can_trigger_from_host_received_chunks) {
+    auto mr = rmm::mr::get_current_device_resource_ref();
+    auto br = rapidsmpf::BufferResource::create(mr);
+    auto stream = rmm::cuda_stream_default;
+    TempDir temp_dir;
+
+    ReceivedChunks received{
+        1,
+        ReceivedChunks::DiskOptions{
+            .mode = ReceivedChunks::DiskMode::AUTO,
+            .scratch_dir = temp_dir.path(),
+            .trigger_non_device_bytes = 1,
+            .host_resident_limit = std::numeric_limits<std::size_t>::max(),
+            .max_pending_write_bytes = 1_MiB,
+        }
+    };
+
+    auto packed_data =
+        move_to_host(generate_packed_data<int>(8, 19, stream, *br), *br, stream);
+    auto const data_size = packed_data.data->size;
+    received.insert(
+        rapidsmpf::shuffler::detail::Chunk::from_packed_data(0, 0, std::move(packed_data))
+    );
+
+    EXPECT_TRUE(received.disk_mode_enabled());
+    EXPECT_GE(received.cumulative_non_device_bytes(), data_size);
+    wait_until_disk_idle(received);
+    EXPECT_EQ(received.host_resident_bytes(), 0);
+    EXPECT_EQ(received.pending_disk_write_bytes(), 0);
+    EXPECT_EQ(received.disk_bytes(), data_size);
+
+    auto chunks = received.extract(0, br.get());
+    ASSERT_EQ(chunks.size(), 1);
+    validate_packed_data<int>(
+        release_packed_data(std::move(chunks.front())), 8, 19, stream, *br
+    );
+}
+
 TEST(MetadataMessage, round_trip) {
     auto stream = rmm::cuda_stream_default;
     auto mr = rmm::mr::get_current_device_resource_ref();

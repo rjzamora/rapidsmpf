@@ -35,6 +35,12 @@ inline const std::unordered_map<std::string, std::string> DEFAULTS{
     {"num_streaming_threads", "1"},
     {"memory_reserve_timeout", "100ms"},
     {"allow_overbooking_by_default", "true"},
+    {"shuffle_disk", "off"},
+    {"shuffle_disk_scratch_dir", "off"},
+    {"shuffle_disk_trigger_non_device_bytes", "1GiB"},
+    {"shuffle_disk_host_resident_limit", "disabled"},
+    {"shuffle_disk_max_pending_write_bytes", "1GiB"},
+    {"shuffle_disk_min_spill_chunk_bytes", "0B"},
     {"log", "WARN"},
     {"ucxx_progress_mode", "thread-blocking"},
 };

@@ -349,6 +349,9 @@ class Shuffler {
     std::condition_variable cv_;
     FinishedCallback finished_callback_;  ///< Called once when data can be extracted.
 
+    std::atomic<std::size_t> last_logged_disk_write_bytes_{0};
+    std::atomic<std::size_t> last_logged_disk_read_bytes_{0};
+
     class Progress;
 };
 

@@ -5,9 +5,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <filesystem>
 #include <functional>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <ranges>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -15,6 +20,7 @@
 #include <rapidsmpf/communicator/communicator.hpp>
 #include <rapidsmpf/communicator/metadata_payload_exchange/core.hpp>
 #include <rapidsmpf/communicator/metadata_payload_exchange/tag.hpp>
+#include <rapidsmpf/config.hpp>
 #include <rapidsmpf/memory/buffer.hpp>
 #include <rapidsmpf/memory/buffer_resource.hpp>
 #include <rapidsmpf/memory/packed_data.hpp>
@@ -22,12 +28,82 @@
 #include <rapidsmpf/shuffler/chunk.hpp>
 #include <rapidsmpf/shuffler/shuffler.hpp>
 #include <rapidsmpf/utils/misc.hpp>
+#include <rapidsmpf/utils/string.hpp>
 
 namespace rapidsmpf::shuffler {
 
 using namespace detail;
 
 namespace {
+
+ReceivedChunks::DiskMode parse_shuffle_disk_mode(std::string const& value) {
+    auto const mode = to_lower(trim(value));
+    if (mode.empty() || mode == "off" || mode == "false" || mode == "no"
+        || mode == "disabled" || mode == "disable" || mode == "none")
+    {
+        return ReceivedChunks::DiskMode::OFF;
+    }
+    if (mode == "auto" || mode == "on" || mode == "true" || mode == "yes") {
+        return ReceivedChunks::DiskMode::AUTO;
+    }
+    if (mode == "force" || mode == "forced") {
+        return ReceivedChunks::DiskMode::FORCE;
+    }
+    RAPIDSMPF_FAIL(
+        "shuffle_disk must be one of off, auto, or force", std::invalid_argument
+    );
+}
+
+std::optional<std::filesystem::path> parse_optional_path(std::string const& value) {
+    auto parsed = parse_optional(value);
+    if (!parsed.has_value() || trim(*parsed).empty()) {
+        return std::nullopt;
+    }
+    return std::filesystem::path(trim(*parsed));
+}
+
+std::size_t parse_optional_nbytes_or_max(std::string const& value) {
+    auto parsed = parse_optional(value);
+    if (!parsed.has_value() || trim(*parsed).empty()) {
+        return std::numeric_limits<std::size_t>::max();
+    }
+    return parse_nbytes_unsigned(*parsed);
+}
+
+ReceivedChunks::DiskOptions disk_options_from_environment() {
+    config::Options options{config::get_environment_variables()};
+    auto mode =
+        options.get<ReceivedChunks::DiskMode>("shuffle_disk", parse_shuffle_disk_mode);
+    auto scratch_dir = options.get<std::optional<std::filesystem::path>>(
+        "shuffle_disk_scratch_dir", parse_optional_path
+    );
+
+    if (mode != ReceivedChunks::DiskMode::OFF && !scratch_dir.has_value()) {
+        RAPIDSMPF_EXPECTS(
+            mode != ReceivedChunks::DiskMode::FORCE,
+            "shuffle_disk=force requires shuffle_disk_scratch_dir",
+            std::invalid_argument
+        );
+        mode = ReceivedChunks::DiskMode::OFF;
+    }
+
+    return ReceivedChunks::DiskOptions{
+        .mode = mode,
+        .scratch_dir = scratch_dir.value_or(std::filesystem::path{}),
+        .trigger_non_device_bytes = options.get<std::size_t>(
+            "shuffle_disk_trigger_non_device_bytes", parse_optional_nbytes_or_max
+        ),
+        .host_resident_limit = options.get<std::size_t>(
+            "shuffle_disk_host_resident_limit", parse_optional_nbytes_or_max
+        ),
+        .max_pending_write_bytes = options.get<std::size_t>(
+            "shuffle_disk_max_pending_write_bytes", parse_nbytes_unsigned
+        ),
+        .min_spill_chunk_bytes = options.get<std::size_t>(
+            "shuffle_disk_min_spill_chunk_bytes", parse_nbytes_unsigned
+        ),
+    };
+}
 
 /**
  * @brief Convert chunks into messages for communication.
@@ -149,6 +225,27 @@ class Shuffler::Progress {
             }
         }
 
+        shuffler_.received_.progress(shuffler_.br_);
+        auto const disk_write_bytes = shuffler_.received_.cumulative_disk_write_bytes();
+        auto const disk_read_bytes = shuffler_.received_.cumulative_disk_read_bytes();
+        auto logged_write_bytes =
+            shuffler_.last_logged_disk_write_bytes_.load(std::memory_order_relaxed);
+        auto logged_read_bytes =
+            shuffler_.last_logged_disk_read_bytes_.load(std::memory_order_relaxed);
+        if (disk_write_bytes != logged_write_bytes
+            || disk_read_bytes != logged_read_bytes)
+        {
+            shuffler_.last_logged_disk_write_bytes_.store(
+                disk_write_bytes, std::memory_order_relaxed
+            );
+            shuffler_.last_logged_disk_read_bytes_.store(
+                disk_read_bytes, std::memory_order_relaxed
+            );
+            shuffler_.comm_->logger()->debug(
+                "Shuffler disk progress: ", shuffler_.received_.disk_status()
+            );
+        }
+
         // Signal the MPE that no more messages will be sent once all application
         // messages have been flushed from to_send_ into the MPE.
         if (!mpe_finish_called_
@@ -160,8 +257,9 @@ class Shuffler::Progress {
         }
 
         // There are no messages to be posted, or waiting to be completed.
-        bool const containers_empty =
-            shuffler_.mpe_->is_idle() && shuffler_.to_send_.empty();
+        bool const containers_empty = shuffler_.mpe_->is_idle()
+                                      && shuffler_.to_send_.empty()
+                                      && shuffler_.received_.disk_idle();
         // We've inserted a finish message and we've received everything we expect.
         bool const is_finished =
             shuffler_.locally_finished_.load(std::memory_order_acquire)
@@ -223,7 +321,9 @@ Shuffler::Shuffler(
       partition_owner{std::move(partition_owner_fn)},
       br_{br},
       to_send_{},
-      received_{safe_cast<std::size_t>(total_num_partitions)},
+      received_{
+          safe_cast<std::size_t>(total_num_partitions), disk_options_from_environment()
+      },
       comm_{std::move(comm)},
       mpe_{
           mpe ? std::move(mpe)
@@ -248,6 +348,9 @@ Shuffler::Shuffler(
     );
     RAPIDSMPF_EXPECTS(comm_ != nullptr, "the communicator pointer cannot be NULL");
     RAPIDSMPF_EXPECTS(br_ != nullptr, "the buffer resource pointer cannot be NULL");
+    if (received_.disk_configured()) {
+        comm_->logger()->debug("Shuffler disk configured: ", received_.disk_status());
+    }
 
     // We need to register the progress function with the progress thread, but
     // that cannot be done in the constructor's initializer list because the
@@ -385,7 +488,13 @@ std::vector<PackedData> Shuffler::extract(PartID pid) {
         return std::vector<PackedData>{};
     }
 
-    auto chunks = received_.extract(pid);
+    auto chunks = received_.extract(pid, br_);
+    auto const disk_read_bytes = received_.cumulative_disk_read_bytes();
+    auto logged_read_bytes = last_logged_disk_read_bytes_.load(std::memory_order_relaxed);
+    if (disk_read_bytes != logged_read_bytes) {
+        last_logged_disk_read_bytes_.store(disk_read_bytes, std::memory_order_relaxed);
+        comm_->logger()->debug("Shuffler disk extract: ", received_.disk_status());
+    }
 
     std::vector<PackedData> ret;
     ret.reserve(chunks.size());
