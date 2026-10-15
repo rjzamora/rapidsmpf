@@ -210,6 +210,34 @@ TEST_P(SparseAlltoallMemoryTest, basic_ring_exchange) {
     }
 }
 
+TEST_F(SparseAlltoallTest, completed_receive_buffers_are_spillable) {
+    auto const& comm = GlobalEnvironment->comm_;
+    if (comm->nranks() < 2) {
+        GTEST_SKIP() << "requires at least 2 ranks";
+    }
+
+    auto [srcs, dsts] = ring_peers(comm);
+    rapidsmpf::coll::SparseAlltoall exchange(comm, 0, br.get(), srcs, dsts);
+    exchange.insert(
+        dsts.front(),
+        make_payload(
+            comm->rank(),
+            comm->rank(),
+            rapidsmpf::MemoryType::DEVICE,
+            *br,
+            br->stream_pool()->get_stream()
+        )
+    );
+    exchange.insert_finished();
+    exchange.wait(std::chrono::seconds{30});
+
+    EXPECT_GE(br->spill_manager().spill(sizeof(int)), sizeof(int));
+    auto received = exchange.extract(srcs.front());
+    ASSERT_EQ(received.size(), 1);
+    EXPECT_NE(received.front().data->mem_type(), rapidsmpf::MemoryType::DEVICE);
+    EXPECT_EQ(decode_payload(received.front()), srcs.front());
+}
+
 TEST_F(SparseAlltoallTest, payload_statistics) {
     auto const& comm = GlobalEnvironment->comm_;
     ClearedStatistics statistics{comm->progress_thread()->statistics()};

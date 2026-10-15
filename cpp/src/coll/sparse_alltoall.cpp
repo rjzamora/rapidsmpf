@@ -44,7 +44,7 @@ SparseAlltoall::SparseAlltoall(
             std::out_of_range
         );
         RAPIDSMPF_EXPECTS(
-            source_states_.emplace(src, SourceState{}).second,
+            source_states_.try_emplace(src).second,
             "SparseAlltoall source rank list must be unique",
             std::invalid_argument
         );
@@ -64,6 +64,10 @@ SparseAlltoall::SparseAlltoall(
     }
     function_id_ =
         comm_->progress_thread()->add_function([this]() { return event_loop(); });
+    spill_function_id_ = br_->spill_manager().add_spill_function(
+        [this](std::size_t amount) -> std::size_t { return spill(amount); },
+        /* priority = */ 0
+    );
 }
 
 SparseAlltoall::~SparseAlltoall() noexcept {
@@ -71,6 +75,7 @@ SparseAlltoall::~SparseAlltoall() noexcept {
         locally_finished_.load(std::memory_order_acquire),
         "Destroying SparseAlltoall without `insert_finished()`"
     );
+    br_->spill_manager().remove_spill_function(spill_function_id_);
     comm_->progress_thread()->remove_function(function_id_);
 }
 
@@ -141,17 +146,28 @@ std::vector<PackedData> SparseAlltoall::extract(Rank src) {
         RAPIDSMPF_EXPECTS(can_extract_, "Extracting before all chunks are ready");
     }
     auto& state = state_it->second;
-    std::ranges::sort(state.chunks, std::less{}, [](auto const& chunk) {
+    auto chunks = state.chunks.extract();
+    std::ranges::sort(chunks, std::less{}, [](auto const& chunk) {
         return chunk->sequence();
     });
 
     std::vector<PackedData> result;
-    result.reserve(state.chunks.size());
-    for (auto& chunk : state.chunks) {
+    result.reserve(chunks.size());
+    for (auto& chunk : chunks) {
         result.push_back(chunk->release());
     }
-    state.chunks.clear();
     return result;
+}
+
+std::size_t SparseAlltoall::spill(std::size_t amount) {
+    auto spilled = outgoing_.spill(br_, amount);
+    for (auto& [_, state] : source_states_) {
+        if (spilled >= amount) {
+            break;
+        }
+        spilled += state.chunks.spill(br_, amount - spilled);
+    }
+    return spilled;
 }
 
 void SparseAlltoall::send_ready_messages() {
@@ -209,7 +225,7 @@ void SparseAlltoall::receive_data_messages() {
             }
             processed++;
             if (chunk->data_size() == 0) {
-                state.chunks.push_back(std::move(chunk));
+                state.chunks.insert(std::move(chunk));
             } else {
                 statistics->add_bytes_stat(
                     "sparsealltoall-payload-recv", chunk->data_size()
@@ -232,7 +248,7 @@ void SparseAlltoall::complete_data_messages() {
             !chunk->is_finish(), "SparseAlltoall can only complete non-finish chunks"
         );
         auto& state = source_states_[chunk->origin()];
-        state.chunks.push_back(std::move(chunk));
+        state.chunks.insert(std::move(chunk));
     }
 }
 

@@ -18,6 +18,7 @@
 #include <rapidsmpf/communicator/communicator.hpp>
 #include <rapidsmpf/memory/buffer_resource.hpp>
 #include <rapidsmpf/memory/packed_data.hpp>
+#include <rapidsmpf/memory/spill_manager.hpp>
 #include <rapidsmpf/progress_thread.hpp>
 
 namespace rapidsmpf::coll {
@@ -148,7 +149,7 @@ class SparseAlltoall {
     struct SourceState {
         std::uint64_t expected_count{0};
         std::uint64_t received_count{0};
-        std::vector<std::unique_ptr<detail::Chunk>> chunks{};
+        detail::PostBox chunks{};
         std::vector<std::unique_ptr<detail::Chunk>> incoming{};
 
         [[nodiscard]] bool ready() const noexcept {
@@ -164,6 +165,8 @@ class SparseAlltoall {
     void receive_data_messages();
     /// @brief Complete receives for data messages.
     void complete_data_messages();
+    /// @brief Spill queued device buffers.
+    [[nodiscard]] std::size_t spill(std::size_t amount);
     /// @brief @return true if all internal containers are empty.
     [[nodiscard]] bool containers_empty() const;
     /// @brief @return Progress the communication state and return the progress state.
@@ -188,6 +191,7 @@ class SparseAlltoall {
     std::unordered_map<Rank, SourceState> source_states_;
     std::function<void()> finished_callback_;
     ProgressThread::FunctionID function_id_;
+    SpillManager::SpillFunctionID spill_function_id_{};
 };
 
 }  // namespace rapidsmpf::coll
